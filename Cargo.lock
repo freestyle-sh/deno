@@ -1266,7 +1266,6 @@ dependencies = [
  "windows-sys 0.52.0",
  "winres",
  "yoke",
- "zeromq",
  "zip",
  "zstd",
 ]
