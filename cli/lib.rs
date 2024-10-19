@@ -28,6 +28,8 @@ pub mod util;
 pub mod version;
 pub mod worker;
 
+pub use deno_runtime;
+
 
 use crate::args::flags_from_vec;
 use crate::args::DenoSubcommand;
