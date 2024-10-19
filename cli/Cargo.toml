@@ -11,6 +11,9 @@ license.workspace = true
 repository.workspace = true
 description = "Provides the deno executable"
 
+[lib]
+path = "lib.rs"
+
 [[bin]]
 name = "deno"
 path = "main.rs"
