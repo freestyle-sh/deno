@@ -9,6 +9,16 @@
 //!   Diagnostics are compile-time type errors, whereas JsErrors are runtime
 //!   exceptions.
 
+use crate::ops::fs_events::FsEventsError;
+use crate::ops::http::HttpStartError;
+use crate::ops::os::OsError;
+use crate::ops::permissions::PermissionError;
+use crate::ops::process::CheckRunPermissionError;
+use crate::ops::process::ProcessError;
+use crate::ops::signal::SignalError;
+use crate::ops::tty::TtyError;
+use crate::ops::web_worker::SyncFetchError;
+use crate::ops::worker_host::CreateWorkerError;
 use deno_broadcast_channel::BroadcastChannelError;
 use deno_cache::CacheError;
 use deno_canvas::CanvasError;
@@ -40,6 +50,12 @@ use deno_kv::KvError;
 use deno_kv::KvMutationError;
 use deno_napi::NApiError;
 use deno_net::ops::NetError;
+use deno_permissions::ChildPermissionError;
+use deno_permissions::NetDescriptorFromUrlParseError;
+use deno_permissions::PathResolveError;
+use deno_permissions::PermissionCheckError;
+use deno_permissions::RunDescriptorParseError;
+use deno_permissions::SysDescriptorParseError;
 use deno_tls::TlsError;
 use deno_web::BlobError;
 use deno_web::CompressionError;
@@ -49,10 +65,59 @@ use deno_web::WebError;
 use deno_websocket::HandshakeError;
 use deno_websocket::WebsocketError;
 use deno_webstorage::WebStorageError;
+use rustyline::error::ReadlineError;
 use std::env;
 use std::error::Error;
 use std::io;
 use std::sync::Arc;
+
+fn get_run_descriptor_parse_error(e: &RunDescriptorParseError) -> &'static str {
+  match e {
+    RunDescriptorParseError::Which(_) => "Error",
+    RunDescriptorParseError::PathResolve(e) => get_path_resolve_error(e),
+    RunDescriptorParseError::EmptyRunQuery => "Error",
+  }
+}
+
+fn get_sys_descriptor_parse_error(e: &SysDescriptorParseError) -> &'static str {
+  match e {
+    SysDescriptorParseError::InvalidKind(_) => "TypeError",
+    SysDescriptorParseError::Empty => "Error",
+  }
+}
+
+fn get_path_resolve_error(e: &PathResolveError) -> &'static str {
+  match e {
+    PathResolveError::CwdResolve(e) => get_io_error_class(e),
+    PathResolveError::EmptyPath => "Error",
+  }
+}
+
+fn get_permission_error_class(e: &PermissionError) -> &'static str {
+  match e {
+    PermissionError::InvalidPermissionName(_) => "ReferenceError",
+    PermissionError::PathResolve(e) => get_path_resolve_error(e),
+    PermissionError::NetDescriptorParse(_) => "URIError",
+    PermissionError::SysDescriptorParse(e) => get_sys_descriptor_parse_error(e),
+    PermissionError::RunDescriptorParse(e) => get_run_descriptor_parse_error(e),
+  }
+}
+
+fn get_permission_check_error_class(e: &PermissionCheckError) -> &'static str {
+  match e {
+    PermissionCheckError::PermissionDenied(_) => "NotCapable",
+    PermissionCheckError::InvalidFilePath(_) => "URIError",
+    PermissionCheckError::NetDescriptorForUrlParse(e) => match e {
+      NetDescriptorFromUrlParseError::MissingHost(_) => "TypeError",
+      NetDescriptorFromUrlParseError::Host(_) => "URIError",
+    },
+    PermissionCheckError::SysDescriptorParse(e) => {
+      get_sys_descriptor_parse_error(e)
+    }
+    PermissionCheckError::PathResolve(e) => get_path_resolve_error(e),
+    PermissionCheckError::HostParse(_) => "URIError",
+  }
+}
 
 fn get_dlopen_error_class(error: &dlopen2::Error) -> &'static str {
   use dlopen2::Error::*;
@@ -436,7 +501,7 @@ fn get_napi_error_class(e: &NApiError) -> &'static str {
     NApiError::InvalidPath
     | NApiError::LibLoading(_)
     | NApiError::ModuleNotFound(_) => "TypeError",
-    NApiError::Permission(e) => get_error_class_name(e).unwrap_or("Error"),
+    NApiError::Permission(e) => get_permission_check_error_class(e),
   }
 }
 
@@ -514,7 +579,7 @@ fn get_ffi_repr_error_class(e: &ReprError) -> &'static str {
     ReprError::InvalidF32 => "TypeError",
     ReprError::InvalidF64 => "TypeError",
     ReprError::InvalidPointer => "TypeError",
-    ReprError::Permission(e) => get_error_class_name(e).unwrap_or("Error"),
+    ReprError::Permission(e) => get_permission_check_error_class(e),
   }
 }
 
@@ -522,7 +587,7 @@ fn get_ffi_dlfcn_error_class(e: &DlfcnError) -> &'static str {
   match e {
     DlfcnError::RegisterSymbol { .. } => "Error",
     DlfcnError::Dlopen(_) => "Error",
-    DlfcnError::Permission(e) => get_error_class_name(e).unwrap_or("Error"),
+    DlfcnError::Permission(e) => get_permission_check_error_class(e),
     DlfcnError::Other(e) => get_error_class_name(e).unwrap_or("Error"),
   }
 }
@@ -540,7 +605,7 @@ fn get_ffi_callback_error_class(e: &CallbackError) -> &'static str {
   match e {
     CallbackError::Resource(e) => get_error_class_name(e).unwrap_or("Error"),
     CallbackError::Other(e) => get_error_class_name(e).unwrap_or("Error"),
-    CallbackError::Permission(e) => get_error_class_name(e).unwrap_or("Error"),
+    CallbackError::Permission(e) => get_permission_check_error_class(e),
   }
 }
 
@@ -549,8 +614,9 @@ fn get_ffi_call_error_class(e: &CallError) -> &'static str {
     CallError::IR(_) => "TypeError",
     CallError::NonblockingCallFailure(_) => "Error",
     CallError::InvalidSymbol(_) => "TypeError",
-    CallError::Permission(e) => get_error_class_name(e).unwrap_or("Error"),
+    CallError::Permission(e) => get_permission_check_error_class(e),
     CallError::Callback(e) => get_ffi_callback_error_class(e),
+    CallError::Resource(e) => get_error_class_name(e).unwrap_or("Error"),
   }
 }
 
@@ -624,9 +690,8 @@ fn get_broadcast_channel_error(error: &BroadcastChannelError) -> &'static str {
 
 fn get_fetch_error(error: &FetchError) -> &'static str {
   match error {
-    FetchError::Resource(e) | FetchError::Permission(e) => {
-      get_error_class_name(e).unwrap_or("Error")
-    }
+    FetchError::Resource(e) => get_error_class_name(e).unwrap_or("Error"),
+    FetchError::Permission(e) => get_permission_check_error_class(e),
     FetchError::NetworkError => "TypeError",
     FetchError::FsNotGet(_) => "TypeError",
     FetchError::InvalidUrl(_) => "TypeError",
@@ -660,9 +725,8 @@ fn get_http_client_create_error(error: &HttpClientCreateError) -> &'static str {
 
 fn get_websocket_error(error: &WebsocketError) -> &'static str {
   match error {
-    WebsocketError::Permission(e) | WebsocketError::Resource(e) => {
-      get_error_class_name(e).unwrap_or("Error")
-    }
+    WebsocketError::Resource(e) => get_error_class_name(e).unwrap_or("Error"),
+    WebsocketError::Permission(e) => get_permission_check_error_class(e),
     WebsocketError::Url(e) => get_url_parse_error_class(e),
     WebsocketError::Io(e) => get_io_error_class(e),
     WebsocketError::WebSocket(_) => "TypeError",
@@ -695,18 +759,14 @@ fn get_websocket_handshake_error(error: &HandshakeError) -> &'static str {
   }
 }
 
-fn get_fs_error(error: &FsOpsError) -> &'static str {
+fn get_fs_ops_error(error: &FsOpsError) -> &'static str {
   match error {
     FsOpsError::Io(e) => get_io_error_class(e),
-    FsOpsError::OperationError(e) => match &e.err {
-      FsError::Io(e) => get_io_error_class(e),
-      FsError::FileBusy => "Busy",
-      FsError::NotSupported => "NotSupported",
-      FsError::NotCapable(_) => "NotCapable",
-    },
-    FsOpsError::Permission(e)
-    | FsOpsError::Resource(e)
-    | FsOpsError::Other(e) => get_error_class_name(e).unwrap_or("Error"),
+    FsOpsError::OperationError(e) => get_fs_error(&e.err),
+    FsOpsError::Permission(e) => get_permission_check_error_class(e),
+    FsOpsError::Resource(e) | FsOpsError::Other(e) => {
+      get_error_class_name(e).unwrap_or("Error")
+    }
     FsOpsError::InvalidUtf8(_) => "InvalidData",
     FsOpsError::StripPrefix(_) => "Error",
     FsOpsError::Canceled(e) => {
@@ -773,9 +833,10 @@ fn get_net_error(error: &NetError) -> &'static str {
     NetError::SocketBusy => "Busy",
     NetError::Io(e) => get_io_error_class(e),
     NetError::AcceptTaskOngoing => "Busy",
-    NetError::RootCertStore(e)
-    | NetError::Permission(e)
-    | NetError::Resource(e) => get_error_class_name(e).unwrap_or("Error"),
+    NetError::RootCertStore(e) | NetError::Resource(e) => {
+      get_error_class_name(e).unwrap_or("Error")
+    }
+    NetError::Permission(e) => get_permission_check_error_class(e),
     NetError::NoResolvedAddress => "Error",
     NetError::AddrParse(_) => "Error",
     NetError::Map(e) => get_net_map_error(e),
@@ -803,6 +864,121 @@ fn get_net_map_error(error: &deno_net::io::MapError) -> &'static str {
   match error {
     deno_net::io::MapError::Io(e) => get_io_error_class(e),
     deno_net::io::MapError::NoResources => "Error",
+  }
+}
+
+fn get_child_permission_error(e: &ChildPermissionError) -> &'static str {
+  match e {
+    ChildPermissionError::Escalation => "NotCapable",
+    ChildPermissionError::PathResolve(e) => get_path_resolve_error(e),
+    ChildPermissionError::NetDescriptorParse(_) => "URIError",
+    ChildPermissionError::EnvDescriptorParse(_) => "Error",
+    ChildPermissionError::SysDescriptorParse(e) => {
+      get_sys_descriptor_parse_error(e)
+    }
+    ChildPermissionError::RunDescriptorParse(e) => {
+      get_run_descriptor_parse_error(e)
+    }
+  }
+}
+
+fn get_create_worker_error(error: &CreateWorkerError) -> &'static str {
+  match error {
+    CreateWorkerError::ClassicWorkers => "DOMExceptionNotSupportedError",
+    CreateWorkerError::Permission(e) => get_child_permission_error(e),
+    CreateWorkerError::ModuleResolution(e) => {
+      get_module_resolution_error_class(e)
+    }
+    CreateWorkerError::Io(e) => get_io_error_class(e),
+    CreateWorkerError::MessagePort(e) => get_web_message_port_error_class(e),
+  }
+}
+
+fn get_tty_error(error: &TtyError) -> &'static str {
+  match error {
+    TtyError::Resource(e) | TtyError::Other(e) => {
+      get_error_class_name(e).unwrap_or("Error")
+    }
+    TtyError::Io(e) => get_io_error_class(e),
+    #[cfg(unix)]
+    TtyError::Nix(e) => get_nix_error_class(e),
+  }
+}
+
+fn get_readline_error(error: &ReadlineError) -> &'static str {
+  match error {
+    ReadlineError::Io(e) => get_io_error_class(e),
+    ReadlineError::Eof => "Error",
+    ReadlineError::Interrupted => "Error",
+    #[cfg(unix)]
+    ReadlineError::Errno(e) => get_nix_error_class(e),
+    ReadlineError::WindowResized => "Error",
+    #[cfg(windows)]
+    ReadlineError::Decode(_) => "Error",
+    #[cfg(windows)]
+    ReadlineError::SystemError(_) => "Error",
+    _ => "Error",
+  }
+}
+
+fn get_signal_error(error: &SignalError) -> &'static str {
+  match error {
+    SignalError::InvalidSignalStr(_) => "TypeError",
+    SignalError::InvalidSignalInt(_) => "TypeError",
+    SignalError::SignalNotAllowed(_) => "TypeError",
+    SignalError::Io(e) => get_io_error_class(e),
+  }
+}
+
+fn get_fs_events_error(error: &FsEventsError) -> &'static str {
+  match error {
+    FsEventsError::Resource(e) => get_error_class_name(e).unwrap_or("Error"),
+    FsEventsError::Permission(e) => get_permission_check_error_class(e),
+    FsEventsError::Notify(e) => get_notify_error_class(e),
+    FsEventsError::Canceled(e) => {
+      let io_err: io::Error = e.to_owned().into();
+      get_io_error_class(&io_err)
+    }
+  }
+}
+
+fn get_http_start_error(error: &HttpStartError) -> &'static str {
+  match error {
+    HttpStartError::TcpStreamInUse => "Busy",
+    HttpStartError::TlsStreamInUse => "Busy",
+    HttpStartError::UnixSocketInUse => "Busy",
+    HttpStartError::ReuniteTcp(_) => "Error",
+    #[cfg(unix)]
+    HttpStartError::ReuniteUnix(_) => "Error",
+    HttpStartError::Io(e) => get_io_error_class(e),
+    HttpStartError::Other(e) => get_error_class_name(e).unwrap_or("Error"),
+  }
+}
+
+fn get_process_error(error: &ProcessError) -> &'static str {
+  match error {
+    ProcessError::SpawnFailed { error, .. } => get_process_error(error),
+    ProcessError::FailedResolvingCwd(e) | ProcessError::Io(e) => {
+      get_io_error_class(e)
+    }
+    ProcessError::Permission(e) => get_permission_check_error_class(e),
+    ProcessError::Resource(e) => get_error_class_name(e).unwrap_or("Error"),
+    ProcessError::BorrowMut(_) => "Error",
+    ProcessError::Which(_) => "Error",
+    ProcessError::ChildProcessAlreadyTerminated => "TypeError",
+    ProcessError::Signal(e) => get_signal_error(e),
+    ProcessError::MissingCmd => "Error",
+    ProcessError::InvalidPid => "TypeError",
+    #[cfg(unix)]
+    ProcessError::Nix(e) => get_nix_error_class(e),
+    ProcessError::RunPermission(e) => match e {
+      CheckRunPermissionError::Permission(e) => {
+        get_permission_check_error_class(e)
+      }
+      CheckRunPermissionError::Other(e) => {
+        get_error_class_name(e).unwrap_or("Error")
+      }
+    },
   }
 }
 
@@ -859,10 +1035,258 @@ fn get_websocket_upgrade_error(error: &WebSocketUpgradeError) -> &'static str {
   }
 }
 
+fn get_fs_error(e: &FsError) -> &'static str {
+  match &e {
+    FsError::Io(e) => get_io_error_class(e),
+    FsError::FileBusy => "Busy",
+    FsError::NotSupported => "NotSupported",
+    FsError::NotCapable(_) => "NotCapable",
+  }
+}
+
+mod node {
+  use super::get_error_class_name;
+  use super::get_io_error_class;
+  use super::get_permission_check_error_class;
+  use super::get_serde_json_error_class;
+  use super::get_url_parse_error_class;
+  pub use deno_node::ops::blocklist::BlocklistError;
+  pub use deno_node::ops::fs::FsError;
+  pub use deno_node::ops::http2::Http2Error;
+  pub use deno_node::ops::idna::IdnaError;
+  pub use deno_node::ops::ipc::IpcError;
+  pub use deno_node::ops::ipc::IpcJsonStreamError;
+  use deno_node::ops::os::priority::PriorityError;
+  pub use deno_node::ops::os::OsError;
+  pub use deno_node::ops::require::RequireError;
+  pub use deno_node::ops::worker_threads::WorkerThreadsFilenameError;
+  pub use deno_node::ops::zlib::brotli::BrotliError;
+  pub use deno_node::ops::zlib::mode::ModeError;
+  pub use deno_node::ops::zlib::ZlibError;
+
+  pub fn get_blocklist_error(error: &BlocklistError) -> &'static str {
+    match error {
+      BlocklistError::AddrParse(_) => "Error",
+      BlocklistError::IpNetwork(_) => "Error",
+      BlocklistError::InvalidAddress => "Error",
+      BlocklistError::IpVersionMismatch => "Error",
+    }
+  }
+
+  pub fn get_fs_error(error: &FsError) -> &'static str {
+    match error {
+      FsError::Permission(e) => get_permission_check_error_class(e),
+      FsError::Io(e) => get_io_error_class(e),
+      #[cfg(windows)]
+      FsError::PathHasNoRoot => "Error",
+      #[cfg(not(any(unix, windows)))]
+      FsError::UnsupportedPlatform => "Error",
+      FsError::Fs(e) => super::get_fs_error(e),
+    }
+  }
+
+  pub fn get_idna_error(error: &IdnaError) -> &'static str {
+    match error {
+      IdnaError::InvalidInput => "RangeError",
+      IdnaError::InputTooLong => "Error",
+      IdnaError::IllegalInput => "RangeError",
+    }
+  }
+
+  pub fn get_ipc_json_stream_error(error: &IpcJsonStreamError) -> &'static str {
+    match error {
+      IpcJsonStreamError::Io(e) => get_io_error_class(e),
+      IpcJsonStreamError::SimdJson(_) => "Error",
+    }
+  }
+
+  pub fn get_ipc_error(error: &IpcError) -> &'static str {
+    match error {
+      IpcError::Resource(e) => get_error_class_name(e).unwrap_or("Error"),
+      IpcError::IpcJsonStream(e) => get_ipc_json_stream_error(e),
+      IpcError::Canceled(e) => {
+        let io_err: std::io::Error = e.to_owned().into();
+        get_io_error_class(&io_err)
+      }
+      IpcError::SerdeJson(e) => get_serde_json_error_class(e),
+    }
+  }
+
+  pub fn get_worker_threads_filename_error(
+    error: &WorkerThreadsFilenameError,
+  ) -> &'static str {
+    match error {
+      WorkerThreadsFilenameError::Permission(e) => {
+        get_error_class_name(e).unwrap_or("Error")
+      }
+      WorkerThreadsFilenameError::UrlParse(e) => get_url_parse_error_class(e),
+      WorkerThreadsFilenameError::InvalidRelativeUrl => "Error",
+      WorkerThreadsFilenameError::UrlFromPathString => "Error",
+      WorkerThreadsFilenameError::UrlToPathString => "Error",
+      WorkerThreadsFilenameError::UrlToPath => "Error",
+      WorkerThreadsFilenameError::FileNotFound(_) => "Error",
+      WorkerThreadsFilenameError::Fs(e) => super::get_fs_error(e),
+    }
+  }
+
+  pub fn get_require_error(error: &RequireError) -> &'static str {
+    match error {
+      RequireError::UrlParse(e) => get_url_parse_error_class(e),
+      RequireError::Permission(e) => get_error_class_name(e).unwrap_or("Error"),
+      RequireError::PackageExportsResolve(_)
+      | RequireError::PackageJsonLoad(_)
+      | RequireError::ClosestPkgJson(_)
+      | RequireError::FilePathConversion(_)
+      | RequireError::UrlConversion(_)
+      | RequireError::ReadModule(_)
+      | RequireError::PackageImportsResolve(_) => "Error",
+      RequireError::Fs(e) | RequireError::UnableToGetCwd(e) => {
+        super::get_fs_error(e)
+      }
+    }
+  }
+
+  pub fn get_http2_error(error: &Http2Error) -> &'static str {
+    match error {
+      Http2Error::Resource(e) => get_error_class_name(e).unwrap_or("Error"),
+      Http2Error::UrlParse(e) => get_url_parse_error_class(e),
+      Http2Error::H2(_) => "Error",
+    }
+  }
+
+  pub fn get_os_error(error: &OsError) -> &'static str {
+    match error {
+      OsError::Priority(e) => match e {
+        PriorityError::Io(e) => get_io_error_class(e),
+        #[cfg(windows)]
+        PriorityError::InvalidPriority => "TypeError",
+      },
+      OsError::Permission(e) => get_permission_check_error_class(e),
+      OsError::FailedToGetCpuInfo => "TypeError",
+      OsError::FailedToGetUserInfo(e) => get_io_error_class(e),
+    }
+  }
+
+  pub fn get_brotli_error(error: &BrotliError) -> &'static str {
+    match error {
+      BrotliError::InvalidEncoderMode => "TypeError",
+      BrotliError::CompressFailed => "TypeError",
+      BrotliError::DecompressFailed => "TypeError",
+      BrotliError::Join(_) => "Error",
+      BrotliError::Resource(e) => get_error_class_name(e).unwrap_or("Error"),
+      BrotliError::Io(e) => get_io_error_class(e),
+    }
+  }
+
+  pub fn get_mode_error(_: &ModeError) -> &'static str {
+    "Error"
+  }
+
+  pub fn get_zlib_error(e: &ZlibError) -> &'static str {
+    match e {
+      ZlibError::NotInitialized => "TypeError",
+      ZlibError::Mode(e) => get_mode_error(e),
+      ZlibError::Other(e) => get_error_class_name(e).unwrap_or("Error"),
+    }
+  }
+}
+
+fn get_os_error(error: &OsError) -> &'static str {
+  match error {
+    OsError::Permission(e) => get_permission_check_error_class(e),
+    OsError::InvalidUtf8(_) => "InvalidData",
+    OsError::EnvEmptyKey => "TypeError",
+    OsError::EnvInvalidKey(_) => "TypeError",
+    OsError::EnvInvalidValue(_) => "TypeError",
+    OsError::Io(e) => get_io_error_class(e),
+    OsError::Var(e) => get_env_var_error_class(e),
+  }
+}
+
+fn get_sync_fetch_error(error: &SyncFetchError) -> &'static str {
+  match error {
+    SyncFetchError::BlobUrlsNotSupportedInContext => "TypeError",
+    SyncFetchError::Io(e) => get_io_error_class(e),
+    SyncFetchError::InvalidScriptUrl => "TypeError",
+    SyncFetchError::InvalidStatusCode(_) => "TypeError",
+    SyncFetchError::ClassicScriptSchemeUnsupportedInWorkers(_) => "TypeError",
+    SyncFetchError::InvalidUri(_) => "Error",
+    SyncFetchError::InvalidMimeType(_) => "DOMExceptionNetworkError",
+    SyncFetchError::MissingMimeType => "DOMExceptionNetworkError",
+    SyncFetchError::Fetch(e) => get_fetch_error(e),
+    SyncFetchError::Join(_) => "Error",
+    SyncFetchError::Other(e) => get_error_class_name(e).unwrap_or("Error"),
+  }
+}
+
 pub fn get_error_class_name(e: &AnyError) -> Option<&'static str> {
   deno_core::error::get_custom_error_class(e)
+    .or_else(|| {
+      e.downcast_ref::<ChildPermissionError>()
+        .map(get_child_permission_error)
+    })
+    .or_else(|| {
+      e.downcast_ref::<PermissionCheckError>()
+        .map(get_permission_check_error_class)
+    })
+    .or_else(|| {
+      e.downcast_ref::<PermissionError>()
+        .map(get_permission_error_class)
+    })
+    .or_else(|| e.downcast_ref::<FsError>().map(get_fs_error))
+    .or_else(|| {
+      e.downcast_ref::<node::BlocklistError>()
+        .map(node::get_blocklist_error)
+    })
+    .or_else(|| e.downcast_ref::<node::FsError>().map(node::get_fs_error))
+    .or_else(|| {
+      e.downcast_ref::<node::IdnaError>()
+        .map(node::get_idna_error)
+    })
+    .or_else(|| {
+      e.downcast_ref::<node::IpcJsonStreamError>()
+        .map(node::get_ipc_json_stream_error)
+    })
+    .or_else(|| e.downcast_ref::<node::IpcError>().map(node::get_ipc_error))
+    .or_else(|| {
+      e.downcast_ref::<node::WorkerThreadsFilenameError>()
+        .map(node::get_worker_threads_filename_error)
+    })
+    .or_else(|| {
+      e.downcast_ref::<node::RequireError>()
+        .map(node::get_require_error)
+    })
+    .or_else(|| {
+      e.downcast_ref::<node::Http2Error>()
+        .map(node::get_http2_error)
+    })
+    .or_else(|| e.downcast_ref::<node::OsError>().map(node::get_os_error))
+    .or_else(|| {
+      e.downcast_ref::<node::BrotliError>()
+        .map(node::get_brotli_error)
+    })
+    .or_else(|| {
+      e.downcast_ref::<node::ModeError>()
+        .map(node::get_mode_error)
+    })
+    .or_else(|| {
+      e.downcast_ref::<node::ZlibError>()
+        .map(node::get_zlib_error)
+    })
     .or_else(|| e.downcast_ref::<NApiError>().map(get_napi_error_class))
     .or_else(|| e.downcast_ref::<WebError>().map(get_web_error_class))
+    .or_else(|| {
+      e.downcast_ref::<CreateWorkerError>()
+        .map(get_create_worker_error)
+    })
+    .or_else(|| e.downcast_ref::<TtyError>().map(get_tty_error))
+    .or_else(|| e.downcast_ref::<ReadlineError>().map(get_readline_error))
+    .or_else(|| e.downcast_ref::<SignalError>().map(get_signal_error))
+    .or_else(|| e.downcast_ref::<FsEventsError>().map(get_fs_events_error))
+    .or_else(|| e.downcast_ref::<HttpStartError>().map(get_http_start_error))
+    .or_else(|| e.downcast_ref::<ProcessError>().map(get_process_error))
+    .or_else(|| e.downcast_ref::<OsError>().map(get_os_error))
+    .or_else(|| e.downcast_ref::<SyncFetchError>().map(get_sync_fetch_error))
     .or_else(|| {
       e.downcast_ref::<CompressionError>()
         .map(get_web_compression_error_class)
@@ -884,7 +1308,7 @@ pub fn get_error_class_name(e: &AnyError) -> Option<&'static str> {
       e.downcast_ref::<WebSocketUpgradeError>()
         .map(get_websocket_upgrade_error)
     })
-    .or_else(|| e.downcast_ref::<FsOpsError>().map(get_fs_error))
+    .or_else(|| e.downcast_ref::<FsOpsError>().map(get_fs_ops_error))
     .or_else(|| {
       e.downcast_ref::<DlfcnError>()
         .map(get_ffi_dlfcn_error_class)
