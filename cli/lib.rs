@@ -14,7 +14,7 @@ pub mod js;
 pub mod jsr;
 pub mod lsp;
 pub mod module_loader;
-pub mod napi;
+// pub mod napi;
 pub mod node;
 pub mod npm;
 pub mod ops;
