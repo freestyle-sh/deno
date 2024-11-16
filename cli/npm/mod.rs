@@ -17,7 +17,8 @@ use deno_npm::registry::NpmPackageInfo;
 use deno_resolver::npm::ByonmInNpmPackageChecker;
 use deno_resolver::npm::ByonmNpmResolver;
 use deno_resolver::npm::CliNpmReqResolver;
-use deno_resolver::npm::ResolvePkgFolderFromDenoReqError;
+// This is a freestyle update, not sure how it builds without it
+pub use deno_resolver::npm::ResolvePkgFolderFromDenoReqError;
 use deno_runtime::deno_node::NodePermissions;
 use deno_runtime::ops::process::NpmProcessStateProvider;
 use deno_semver::package::PackageNv;
