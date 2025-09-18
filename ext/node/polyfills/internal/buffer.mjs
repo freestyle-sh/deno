@@ -113,7 +113,7 @@ import { atob, btoa } from "ext:deno_web/05_base64.js";
 import { Blob } from "ext:deno_web/09_file.js";
 import { untransferableSymbol } from "ext:deno_node/internal_binding/util.ts";
 
-export { atob, Blob, File, btoa };
+export { atob, Blob, btoa };
 
 const utf8Encoder = new TextEncoder();
 
@@ -3008,7 +3008,6 @@ const mod = {
   kStringMaxLength,
   SlowBuffer,
   transcode,
-  File,
 };
 
 // NB(bartlomieju): we want to have a default exports from this module for ES imports,
