@@ -1,5 +1,7 @@
 // Copyright 2018-2025 the Deno authors. MIT license.
 
+use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
@@ -12,28 +14,33 @@ use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use dashmap::DashMap;
 use deno_ast::MediaType;
+use deno_cache_dir::GlobalOrLocalHttpCache;
 use deno_cache_dir::file_fetcher::CacheSetting;
+use deno_core::ModuleSpecifier;
 use deno_core::anyhow::anyhow;
 use deno_core::error::AnyError;
+use deno_core::parking_lot::Mutex;
 use deno_core::serde_json;
-use deno_core::serde_json::json;
 use deno_core::serde_json::Value;
+use deno_core::serde_json::json;
 use deno_core::unsync::spawn;
 use deno_core::url;
 use deno_core::url::Url;
-use deno_core::ModuleSpecifier;
 use deno_graph::CheckJsOption;
 use deno_graph::GraphKind;
 use deno_graph::Resolution;
-use deno_lib::args::get_root_cert_store;
 use deno_lib::args::CaData;
+use deno_lib::args::get_root_cert_store;
 use deno_lib::version::DENO_VERSION_INFO;
+use deno_npm_installer::graph::NpmCachingStrategy;
 use deno_path_util::url_to_file_path;
-use deno_runtime::deno_tls::rustls::RootCertStore;
+use deno_resolver::deno_json::CompilerOptionsKey;
+use deno_resolver::loader::MemoryFilesRc;
 use deno_runtime::deno_tls::RootCertStoreProvider;
+use deno_runtime::deno_tls::rustls::RootCertStore;
 use deno_semver::jsr::JsrPackageReqReference;
-use indexmap::Equivalent;
 use indexmap::IndexMap;
 use indexmap::IndexSet;
 use log::error;
@@ -41,20 +48,21 @@ use node_resolver::NodeResolutionKind;
 use node_resolver::ResolutionMode;
 use serde::Deserialize;
 use serde_json::from_value;
-use tokio::sync::mpsc::unbounded_channel;
+use tokio::sync::OnceCell;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::unbounded_channel;
 use tokio_util::sync::CancellationToken;
 use tower_lsp::jsonrpc::Error as LspError;
 use tower_lsp::jsonrpc::Result as LspResult;
 use tower_lsp::lsp_types::request::*;
 use tower_lsp::lsp_types::*;
 
-use super::analysis::fix_ts_import_changes;
-use super::analysis::ts_changes_to_edit;
 use super::analysis::CodeActionCollection;
 use super::analysis::CodeActionData;
 use super::analysis::TsResponseImportMapper;
+use super::analysis::fix_ts_import_changes;
+use super::analysis::ts_changes_to_edit;
 use super::cache::LspCache;
 use super::capabilities;
 use super::capabilities::semantic_tokens_registration_options;
@@ -62,14 +70,13 @@ use super::client::Client;
 use super::code_lens;
 use super::completions;
 use super::config::Config;
+use super::config::SETTINGS_SECTION;
 use super::config::UpdateImportsOnFileMoveEnabled;
 use super::config::WorkspaceSettings;
-use super::config::SETTINGS_SECTION;
 use super::diagnostics;
 use super::diagnostics::DiagnosticDataSpecifier;
-use super::diagnostics::DiagnosticServerUpdateMessage;
 use super::diagnostics::DiagnosticsServer;
-use super::diagnostics::DiagnosticsState;
+use super::diagnostics::DiagnosticsUpdateMessage;
 use super::documents::Document;
 use super::documents::DocumentModule;
 use super::documents::DocumentModules;
@@ -97,10 +104,15 @@ use crate::args::Flags;
 use crate::args::InternalFlags;
 use crate::args::UnstableFmtOptions;
 use crate::factory::CliFactory;
-use crate::file_fetcher::CliFileFetcher;
+use crate::file_fetcher::CreateCliFileFetcherOptions;
+use crate::file_fetcher::create_cli_file_fetcher;
 use crate::graph_util;
 use crate::http_util::HttpClientProvider;
+use crate::lsp::analysis::fix_ts_import_changes_for_file_rename;
+use crate::lsp::compiler_options::LspCompilerOptionsResolver;
 use crate::lsp::config::ConfigWatchedFileType;
+use crate::lsp::diagnostics::generate_module_diagnostics;
+use crate::lsp::lint::LspLinterResolver;
 use crate::lsp::logging::init_log_file;
 use crate::lsp::tsc::file_text_changes_to_workspace_edit;
 use crate::sys::CliSys;
@@ -160,6 +172,44 @@ pub fn to_lsp_range(referrer: &deno_graph::Range) -> lsp_types::Range {
   }
 }
 
+#[derive(Debug)]
+struct DidChangeBatchQueueEntry {
+  version: i32,
+  content_changes: Vec<TextDocumentContentChangeEvent>,
+}
+
+#[derive(Debug)]
+struct DidChangeBatchQueue {
+  uri: Uri,
+  entries: Mutex<VecDeque<(DidChangeBatchQueueEntry, CancellationToken)>>,
+}
+
+impl DidChangeBatchQueue {
+  fn new(uri: Uri) -> Self {
+    DidChangeBatchQueue {
+      uri,
+      entries: Default::default(),
+    }
+  }
+
+  fn enqueue(&self, entry: DidChangeBatchQueueEntry) -> CancellationToken {
+    let token = CancellationToken::new();
+    self.entries.lock().push_back((entry, token.clone()));
+    token
+  }
+
+  fn dequeue(&self) -> Option<DidChangeBatchQueueEntry> {
+    let (entry, token) = self.entries.lock().pop_front()?;
+    token.cancel();
+    Some(entry)
+  }
+
+  fn clear(&self) {
+    let entries = std::mem::take(&mut *self.entries.lock());
+    entries.into_iter().for_each(|(_, token)| token.cancel());
+  }
+}
+
 #[derive(Debug, Clone)]
 pub struct LanguageServer {
   client: Client,
@@ -171,6 +221,7 @@ pub struct LanguageServer {
   /// `workspace/configuration` requests in the `initialize` handler. See:
   /// https://github.com/Microsoft/language-server-protocol/issues/567#issuecomment-2085131917
   init_flag: AsyncFlag,
+  did_change_batch_queue: RefCell<Option<Arc<DidChangeBatchQueue>>>,
   performance: Arc<Performance>,
 }
 
@@ -179,8 +230,11 @@ pub struct LanguageServer {
 pub struct StateSnapshot {
   pub project_version: usize,
   pub config: Arc<Config>,
+  pub compiler_options_resolver: Arc<LspCompilerOptionsResolver>,
+  pub linter_resolver: Arc<LspLinterResolver>,
   pub document_modules: DocumentModules,
   pub resolver: Arc<LspResolver>,
+  pub cache: Arc<LspCache>,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
@@ -228,20 +282,27 @@ impl LanguageServerTaskQueue {
   }
 }
 
+pub type OnceCellMap<K, V> = DashMap<K, Arc<OnceCell<V>>>;
+
 pub struct Inner {
+  /// (_, notebook_uri) -> _
+  ambient_modules_regex_cache:
+    OnceCellMap<(CompilerOptionsKey, Option<Arc<Uri>>), Option<regex::Regex>>,
   pub cache: LspCache,
   /// The LSP client that this LSP server is connected to.
   pub client: Client,
+  compiler_options_resolver: Arc<LspCompilerOptionsResolver>,
   /// Configuration information.
   pub config: Config,
-  diagnostics_state: Arc<diagnostics::DiagnosticsState>,
-  diagnostics_server: diagnostics::DiagnosticsServer,
+  diagnostics_cache: OnceCellMap<Arc<Uri>, Arc<Vec<Diagnostic>>>,
+  diagnostics_server: Option<diagnostics::DiagnosticsServer>,
   /// The collection of documents that the server is currently handling, either
   /// on disk or "open" within the client.
   pub document_modules: DocumentModules,
   http_client_provider: Arc<HttpClientProvider>,
   initial_cwd: PathBuf,
   jsr_search_api: CliJsrSearchApi,
+  linter_resolver: Arc<LspLinterResolver>,
   /// Handles module registries, which allow discovery of modules
   module_registry: ModuleRegistry,
   /// A lazily create "server" for handling test run requests.
@@ -259,8 +320,6 @@ pub struct Inner {
   /// Set to `self.config.settings.enable_settings_hash()` after
   /// refreshing `self.workspace_files`.
   workspace_files_hash: u64,
-  registry_provider:
-    Arc<dyn deno_lockfile::NpmPackageInfoProvider + Send + Sync>,
   _tracing: Option<super::trace::TracingGuard>,
 }
 
@@ -270,7 +329,6 @@ impl std::fmt::Debug for Inner {
       .field("cache", &self.cache)
       .field("client", &self.client)
       .field("config", &self.config)
-      .field("diagnostics_state", &self.diagnostics_state)
       .field("diagnostics_server", &self.diagnostics_server)
       .field("document_modules", &self.document_modules)
       .field("http_client_provider", &self.http_client_provider)
@@ -297,21 +355,16 @@ impl std::fmt::Debug for Inner {
 }
 
 impl LanguageServer {
-  pub fn new(
-    client: Client,
-    registry_provider: Arc<
-      dyn deno_lockfile::NpmPackageInfoProvider + Send + Sync,
-    >,
-  ) -> Self {
+  pub fn new(client: Client) -> Self {
     let performance = Arc::new(Performance::default());
     Self {
       client: client.clone(),
       inner: Rc::new(tokio::sync::RwLock::new(Inner::new(
         client,
         performance.clone(),
-        registry_provider,
       ))),
       init_flag: Default::default(),
+      did_change_batch_queue: Default::default(),
       performance,
     }
   }
@@ -324,6 +377,7 @@ impl LanguageServer {
     specifiers: Vec<ModuleSpecifier>,
     referrer: ModuleSpecifier,
     force_global_cache: bool,
+    lockfile_skip_write: bool,
   ) -> LspResult<Option<Value>> {
     async fn create_graph_for_caching(
       factory: CliFactory,
@@ -336,7 +390,8 @@ impl LanguageServer {
         .collect::<HashMap<_, _>>();
       let module_graph_builder = factory.module_graph_builder().await?;
       let module_graph_creator = factory.module_graph_creator().await?;
-      let mut inner_loader = module_graph_builder.create_graph_loader();
+      let mut inner_loader =
+        module_graph_builder.create_graph_loader_with_root_permissions();
       let mut loader = crate::lsp::documents::OpenDocumentsGraphLoader {
         inner_loader: &mut inner_loader,
         open_modules: &open_modules,
@@ -346,7 +401,7 @@ impl LanguageServer {
           GraphKind::All,
           roots.clone(),
           &mut loader,
-          graph_util::NpmCachingStrategy::Eager,
+          NpmCachingStrategy::Eager,
         )
         .await?;
       graph_util::graph_valid(
@@ -355,18 +410,20 @@ impl LanguageServer {
         &roots,
         graph_util::GraphValidOptions {
           kind: GraphKind::All,
+          will_type_check: true,
           check_js: CheckJsOption::False,
           exit_integrity_errors: false,
           allow_unknown_media_types: true,
+          allow_unknown_jsr_exports: false,
         },
       )?;
 
       // Update the lockfile on the file system with anything new
       // found after caching
-      if let Ok(Some(lockfile)) = factory.maybe_lockfile().await {
-        if let Err(err) = &lockfile.write_if_changed() {
-          lsp_warn!("{:#}", err);
-        }
+      if let Ok(Some(lockfile)) = factory.maybe_lockfile().await
+        && let Err(err) = &lockfile.write_if_changed()
+      {
+        lsp_warn!("{:#}", err);
       }
 
       Ok(())
@@ -378,10 +435,12 @@ impl LanguageServer {
     let mark = self
       .performance
       .mark_with_args("lsp.cache", (&specifiers, &referrer));
+    *self.did_change_batch_queue.borrow_mut() = None;
     let prepare_cache_result = self.inner.write().await.prepare_cache(
       specifiers,
       referrer,
       force_global_cache,
+      lockfile_skip_write,
     );
 
     match prepare_cache_result {
@@ -400,7 +459,13 @@ impl LanguageServer {
         }
 
         // now get the lock back to update with the new information
-        self.inner.write().await.post_cache().await;
+        *self.did_change_batch_queue.borrow_mut() = None;
+        self
+          .inner
+          .write()
+          .await
+          .post_cache(!lockfile_skip_write)
+          .await;
         self.performance.measure(mark);
       }
       Err(err) => {
@@ -411,24 +476,6 @@ impl LanguageServer {
     }
 
     Ok(Some(json!(true)))
-  }
-
-  /// This request is only used by the lsp integration tests to
-  /// coordinate the tests receiving the latest diagnostics.
-  pub async fn latest_diagnostic_batch_index_request(
-    &self,
-    _token: CancellationToken,
-  ) -> LspResult<Option<Value>> {
-    self.init_flag.wait_raised().await;
-    Ok(
-      self
-        .inner
-        .read()
-        .await
-        .diagnostics_server
-        .latest_batch_index()
-        .map(|v| v.into()),
-    )
   }
 
   pub async fn performance_request(
@@ -520,6 +567,7 @@ impl LanguageServer {
         for (folder_uri, _) in folders.as_ref() {
           folder_settings.push((folder_uri.clone(), configs.next().unwrap()));
         }
+        *self.did_change_batch_queue.borrow_mut() = None;
         self
           .inner
           .write()
@@ -532,13 +580,7 @@ impl LanguageServer {
 }
 
 impl Inner {
-  fn new(
-    client: Client,
-    performance: Arc<Performance>,
-    registry_provider: Arc<
-      dyn deno_lockfile::NpmPackageInfoProvider + Send + Sync,
-    >,
-  ) -> Self {
+  fn new(client: Client, performance: Arc<Performance>) -> Self {
     let cache = LspCache::default();
     let http_client_provider = Arc::new(HttpClientProvider::new(None, None));
     let module_registry = ModuleRegistry::new(
@@ -551,27 +593,23 @@ impl Inner {
       CliNpmSearchApi::new(module_registry.file_fetcher.clone());
     let config = Config::default();
     let ts_server = Arc::new(TsServer::new(performance.clone()));
-    let diagnostics_state = Arc::new(DiagnosticsState::default());
-    let diagnostics_server = DiagnosticsServer::new(
-      client.clone(),
-      performance.clone(),
-      ts_server.clone(),
-      diagnostics_state.clone(),
-    );
     let initial_cwd = std::env::current_dir().unwrap_or_else(|_| {
       panic!("Could not resolve current working directory")
     });
 
     Self {
+      ambient_modules_regex_cache: Default::default(),
       cache,
       client,
+      compiler_options_resolver: Default::default(),
       config,
-      diagnostics_state,
-      diagnostics_server,
+      diagnostics_cache: Default::default(),
+      diagnostics_server: None,
       document_modules: Default::default(),
       http_client_provider,
       initial_cwd: initial_cwd.clone(),
       jsr_search_api,
+      linter_resolver: Default::default(),
       project_version: 0,
       task_queue: Default::default(),
       maybe_testing_server: None,
@@ -585,7 +623,6 @@ impl Inner {
       workspace_files: Default::default(),
       workspace_files_hash: 0,
       _tracing: Default::default(),
-      registry_provider,
     }
   }
 
@@ -638,10 +675,10 @@ impl Inner {
     document: &Document,
   ) -> LspResult<Option<Arc<DocumentModule>>> {
     let Some(module) = self.document_modules.primary_module(document) else {
-      if document
-        .uri()
-        .scheme()
-        .is_some_and(|s| s.eq_lowercase("deno"))
+      let url = uri_to_url(document.uri());
+      if url.scheme() != "file"
+        || self.resolver.in_node_modules(&url)
+        || self.cache.in_cache_directory(&url)
       {
         return Ok(None);
       }
@@ -662,20 +699,14 @@ impl Inner {
   ) -> LspResult<Arc<tsc::NavigationTree>> {
     let mark = self.performance.mark_with_args(
       "lsp.get_navigation_tree",
-      json!({ "uri": &module.specifier }),
+      json!({ "specifier": &module.specifier }),
     );
     let result = module
       .navigation_tree
       .get_or_try_init(|| async {
         self
           .ts_server
-          .get_navigation_tree(
-            self.snapshot(),
-            &module.specifier,
-            module.scope.as_ref(),
-            module.notebook_uri.as_ref(),
-            token,
-          )
+          .get_navigation_tree(self.snapshot(), module, token)
           .await
           .map(Arc::new)
           .map_err(|err| {
@@ -701,8 +732,11 @@ impl Inner {
     Arc::new(StateSnapshot {
       project_version: self.project_version,
       config: Arc::new(self.config.clone()),
+      compiler_options_resolver: self.compiler_options_resolver.clone(),
+      linter_resolver: self.linter_resolver.clone(),
       document_modules: self.document_modules.clone(),
       resolver: self.resolver.snapshot(),
+      cache: Arc::new(self.cache.clone()),
     })
   }
 
@@ -759,8 +793,8 @@ impl Inner {
     let global_cache_url = maybe_cache.and_then(|cache_str| {
       if let Ok(url) = Url::from_file_path(cache_str) {
         Some(url)
-      } else if let Some(root_uri) = self.config.root_url() {
-        root_uri.join(cache_str).inspect_err(|err| lsp_warn!("Failed to resolve custom cache path: {err}")).ok()
+      } else if let Some(root_url) = self.config.root_url() {
+        root_url.join(cache_str).inspect_err(|err| lsp_warn!("Failed to resolve custom cache path: {err}")).ok()
       } else {
         lsp_warn!(
           "The configured cache path \"{cache_str}\" is not resolvable outside of a workspace.",
@@ -774,7 +808,7 @@ impl Inner {
     let maybe_root_path = self
       .config
       .root_url()
-      .and_then(|uri| url_to_file_path(uri).ok());
+      .and_then(|url| url_to_file_path(url).ok());
     let root_cert_store = get_root_cert_store(
       maybe_root_path,
       workspace_settings.certificate_stores.clone(),
@@ -909,10 +943,10 @@ impl Inner {
           .into_iter()
           .map(|folder| {
             let mut url = uri_to_url(&folder.uri);
-            if !url.path().ends_with('/') {
-              if let Ok(mut path_segments) = url.path_segments_mut() {
-                path_segments.push("");
-              }
+            if !url.path().ends_with('/')
+              && let Ok(mut path_segments) = url.path_segments_mut()
+            {
+              path_segments.push("");
             }
             (Arc::new(url), folder)
           })
@@ -921,30 +955,30 @@ impl Inner {
       // rootUri is deprecated by the LSP spec. If it's specified, merge it into
       // workspace_folders.
       #[allow(deprecated)]
-      if let Some(root_uri) = params.root_uri {
-        if !workspace_folders.iter().any(|(_, f)| f.uri == root_uri) {
-          let mut root_url = uri_to_url(&root_uri);
-          let name = root_url
-            .path_segments()
-            .and_then(|s| s.last())
-            .unwrap_or_default()
-            .to_string();
-          if !root_url.path().ends_with('/') {
-            if let Ok(mut path_segments) = root_url.path_segments_mut() {
-              path_segments.push("");
-            }
-          }
-          workspace_folders.insert(
-            0,
-            (
-              Arc::new(root_url),
-              WorkspaceFolder {
-                uri: root_uri,
-                name,
-              },
-            ),
-          );
+      if let Some(root_uri) = params.root_uri
+        && !workspace_folders.iter().any(|(_, f)| f.uri == root_uri)
+      {
+        let mut root_url = uri_to_url(&root_uri);
+        let name = root_url
+          .path_segments()
+          .and_then(|mut s| s.next_back())
+          .unwrap_or_default()
+          .to_string();
+        if !root_url.path().ends_with('/')
+          && let Ok(mut path_segments) = root_url.path_segments_mut()
+        {
+          path_segments.push("");
         }
+        workspace_folders.insert(
+          0,
+          (
+            Arc::new(root_url),
+            WorkspaceFolder {
+              uri: root_uri,
+              name,
+            },
+          ),
+        );
       }
       self.config.set_workspace_folders(workspace_folders);
       if let Some(options) = params.initialization_options {
@@ -956,7 +990,15 @@ impl Inner {
       self.config.set_client_capabilities(params.capabilities);
     }
 
-    self.diagnostics_server.start();
+    if !self.config.diagnostic_capable() {
+      let mut diagnostics_server = DiagnosticsServer::new(
+        self.client.clone(),
+        self.performance.clone(),
+        self.ts_server.clone(),
+      );
+      diagnostics_server.start();
+      self.diagnostics_server = Some(diagnostics_server);
+    }
     self
       .ts_server
       .set_inspector_server_addr(self.config.internal_inspect().to_address());
@@ -1135,15 +1177,18 @@ impl Inner {
 
   #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
   async fn refresh_config_tree(&mut self) {
-    let file_fetcher = CliFileFetcher::new(
-      self.cache.global().clone(),
-      self.http_client_provider.clone(),
-      CliSys::default(),
+    let file_fetcher = create_cli_file_fetcher(
       Default::default(),
-      None,
-      true,
-      CacheSetting::RespectHeaders,
-      super::logging::lsp_log_level(),
+      GlobalOrLocalHttpCache::Global(self.cache.global().clone()),
+      self.http_client_provider.clone(),
+      MemoryFilesRc::default(),
+      CliSys::default(),
+      CreateCliFileFetcherOptions {
+        allow_remote: true,
+        cache_setting: CacheSetting::RespectHeaders,
+        download_log_level: super::logging::lsp_log_level(),
+        progress_bar: None,
+      },
     );
     let file_fetcher = Arc::new(file_fetcher);
     self
@@ -1153,8 +1198,8 @@ impl Inner {
         &self.config.settings,
         &self.workspace_files,
         &file_fetcher,
+        &self.http_client_provider,
         self.cache.deno_dir(),
-        &self.registry_provider,
       )
       .await;
     self
@@ -1162,38 +1207,67 @@ impl Inner {
       .send_did_refresh_deno_configuration_tree_notification(
         self.config.tree.to_did_refresh_params(),
       );
-    for config_file in self.config.tree.config_files() {
-      (|| {
-        let compiler_options = config_file.to_compiler_options().ok()?.options;
-        let jsx_import_source = compiler_options.get("jsxImportSource")?;
-        let jsx_import_source = jsx_import_source.as_str()?.to_string();
-        let referrer = config_file.specifier.clone();
-        let specifier = format!("{jsx_import_source}/jsx-runtime");
-        self.task_queue.queue_task(Box::new(|ls: LanguageServer| {
-          spawn(async move {
-            let specifier = {
-              let inner = ls.inner.read().await;
-              let scoped_resolver =
-                inner.resolver.get_scoped_resolver(Some(&referrer));
-              let resolver = scoped_resolver.as_cli_resolver();
-              let Ok(specifier) = resolver.resolve(
-                &specifier,
-                &referrer,
-                deno_graph::Position::zeroed(),
-                ResolutionMode::Import,
-                NodeResolutionKind::Types,
-              ) else {
-                return;
-              };
-              specifier
+  }
+
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
+  fn refresh_compiler_options_resolver(&mut self) {
+    self.compiler_options_resolver = Arc::new(LspCompilerOptionsResolver::new(
+      &self.config,
+      &self.resolver,
+    ));
+    // TODO(nayeemrmn): This represents a circular dependency between
+    // `LspCompilerOptionsResolver` and `LspResolver` because the former uses
+    // the node resolver to resolve `extends` in tsconfig. Break out the node
+    // resolver from `LspResolver`.
+    self
+      .resolver
+      .set_compiler_options_resolver(&self.compiler_options_resolver.inner);
+  }
+
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
+  fn refresh_linter_resolver(&mut self) {
+    self.linter_resolver = Arc::new(LspLinterResolver::new(
+      &self.config,
+      &self.compiler_options_resolver,
+      &self.resolver,
+    ));
+  }
+
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
+  fn dispatch_cache_jsx_import_sources(&self) {
+    for specifier_config in self
+      .compiler_options_resolver
+      .entries()
+      .filter_map(|(_, d)| d.jsx_import_source_config.as_ref())
+      .flat_map(|c| c.import_source.iter().chain(c.import_source_types.iter()))
+    {
+      let referrer = specifier_config.base.clone();
+      let specifier = format!("{}/jsx-runtime", &specifier_config.specifier);
+      self.task_queue.queue_task(Box::new(|ls: LanguageServer| {
+        spawn(async move {
+          let specifier = {
+            let inner = ls.inner.read().await;
+            let scoped_resolver =
+              inner.resolver.get_scoped_resolver(Some(&referrer));
+            let resolver = scoped_resolver.as_cli_resolver();
+            let Ok(specifier) = resolver.resolve(
+              &specifier,
+              &referrer,
+              deno_graph::Position::zeroed(),
+              ResolutionMode::Import,
+              NodeResolutionKind::Types,
+            ) else {
+              return;
             };
-            if let Err(err) = ls.cache(vec![specifier], referrer, false).await {
-              lsp_warn!("{:#}", err);
-            }
-          });
-        }));
-        Some(())
-      })();
+            specifier
+          };
+          if let Err(err) =
+            ls.cache(vec![specifier], referrer, false, true).await
+          {
+            lsp_warn!("{:#}", err);
+          }
+        });
+      }));
     }
   }
 
@@ -1210,9 +1284,10 @@ impl Inner {
   }
 
   #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
-  async fn refresh_documents_config(&mut self) {
+  fn refresh_documents_config(&mut self) {
     self.document_modules.update_config(
       &self.config,
+      &self.compiler_options_resolver,
       &self.resolver,
       &self.cache,
       &self.workspace_files,
@@ -1220,13 +1295,13 @@ impl Inner {
 
     // refresh the npm specifiers because it might have discovered
     // a @types/node package and now's a good time to do that anyway
-    self.refresh_dep_info().await;
+    self.refresh_dep_info();
 
-    self.project_changed([], ProjectScopesChange::Config);
+    self.project_changed(vec![], ProjectScopesChange::Config);
   }
 
   #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
-  async fn did_open(&mut self, params: DidOpenTextDocumentParams) {
+  fn did_open(&mut self, params: DidOpenTextDocumentParams) {
     let mark = self.performance.mark_with_args("lsp.did_open", &params);
     // `deno:` documents are read-only and should only be handled as server
     // documents.
@@ -1263,15 +1338,11 @@ impl Inner {
     );
     if document.is_diagnosable() {
       self.check_semantic_tokens_capabilities();
-      self.refresh_dep_info().await;
+      self.refresh_dep_info();
       self.project_changed(
-        self
-          .document_modules
-          .primary_specifier(&Document::Open(document.clone()))
-          .map(|s| (s, ChangeKind::Opened)),
+        vec![(Document::Open(document), ChangeKind::Opened)],
         ProjectScopesChange::None,
       );
-      self.diagnostics_server.invalidate(&[document.uri.as_ref()]);
       self.send_diagnostics_update();
       self.send_testing_update();
     }
@@ -1279,53 +1350,44 @@ impl Inner {
   }
 
   #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
-  async fn did_change(&mut self, params: DidChangeTextDocumentParams) {
-    let mark = self.performance.mark_with_args("lsp.did_change", &params);
+  fn did_change_batched(&mut self, batch_queue: Arc<DidChangeBatchQueue>) {
+    let mark = self
+      .performance
+      .mark_with_args("lsp.did_change_batched", &batch_queue.uri);
     // `deno:` documents are read-only and should only be handled as server
     // documents.
-    if params
-      .text_document
+    if batch_queue
       .uri
       .scheme()
       .is_some_and(|s| s.eq_lowercase("deno"))
     {
+      batch_queue.clear();
       return;
     }
-    let document = match self.document_modules.change_document(
-      &params.text_document.uri,
-      params.text_document.version,
-      params.content_changes,
-    ) {
-      Ok(doc) => doc,
-      Err(err) => {
-        error!("{:#}", err);
-        return;
+    let mut document = None;
+    while let Some(entry) = batch_queue.dequeue() {
+      match self.document_modules.change_document(
+        &batch_queue.uri,
+        entry.version,
+        entry.content_changes,
+      ) {
+        Ok(doc) => {
+          document = Some(doc);
+        }
+        Err(err) => {
+          error!("{:#}", err);
+          return;
+        }
       }
-    };
-    if document.is_diagnosable() {
-      let old_scopes_with_node_specifier =
-        self.document_modules.scopes_with_node_specifier();
-      self.refresh_dep_info().await;
-      let mut config_changed = false;
-      if !self
-        .document_modules
-        .scopes_with_node_specifier()
-        .equivalent(&old_scopes_with_node_specifier)
-      {
-        config_changed = true;
-      }
+    }
+    if let Some(document) = document
+      && document.is_diagnosable()
+    {
+      self.refresh_dep_info();
       self.project_changed(
-        self
-          .document_modules
-          .primary_specifier(&Document::Open(document.clone()))
-          .map(|s| (s, ChangeKind::Modified)),
-        if config_changed {
-          ProjectScopesChange::Config
-        } else {
-          ProjectScopesChange::None
-        },
+        vec![(Document::Open(document), ChangeKind::Modified)],
+        ProjectScopesChange::None,
       );
-      self.diagnostics_server.invalidate(&[&document.uri]);
       self.send_diagnostics_update();
       self.send_testing_update();
     }
@@ -1333,7 +1395,7 @@ impl Inner {
   }
 
   #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
-  fn did_save(&mut self, params: DidSaveTextDocumentParams) {
+  async fn did_save(&self, params: DidSaveTextDocumentParams) {
     let _mark = self.performance.measure_scope("lsp.did_save");
     let Ok(Some(document)) = self
       .get_document(
@@ -1348,14 +1410,38 @@ impl Inner {
     else {
       return;
     };
+    let has_no_cache_diagnostics = async || {
+      if let Some(diagnostics_server) = &self.diagnostics_server {
+        diagnostics_server
+          .state
+          .has_no_cache_diagnostics(document.uri())
+      } else {
+        let Ok(Some(module)) = self.get_primary_module(&document) else {
+          return false;
+        };
+        self
+          .get_module_diagnostics(&module, &Default::default())
+          .await
+          .ok()
+          .iter()
+          .flat_map(|d| d.iter())
+          .any(|d| {
+            let Some(NumberOrString::String(code)) = &d.code else {
+              return false;
+            };
+            matches!(
+              code.as_str(),
+              "no-cache" | "not-installed-jsr" | "not-installed-npm"
+            )
+          })
+      }
+    };
     if !self
       .config
       .workspace_settings_for_uri(document.uri())
       .cache_on_save
       || !self.config.uri_enabled(document.uri())
-      || !self
-        .diagnostics_state
-        .has_no_cache_diagnostics(document.uri())
+      || !has_no_cache_diagnostics().await
     {
       return;
     }
@@ -1374,7 +1460,7 @@ impl Inner {
     self.task_queue.queue_task(Box::new(|ls: LanguageServer| {
       spawn(async move {
         if let Err(err) = ls
-          .cache(vec![], module.specifier.as_ref().clone(), false)
+          .cache(vec![], module.specifier.as_ref().clone(), false, true)
           .await
         {
           lsp_warn!(
@@ -1388,16 +1474,13 @@ impl Inner {
   }
 
   #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
-  async fn refresh_dep_info(&mut self) {
+  fn refresh_dep_info(&mut self) {
     let dep_info_by_scope = self.document_modules.dep_info_by_scope();
-    self
-      .resolver
-      .set_dep_info_by_scope(&dep_info_by_scope)
-      .await;
+    self.resolver.set_dep_info_by_scope(&dep_info_by_scope);
   }
 
   #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
-  async fn did_close(&mut self, params: DidCloseTextDocumentParams) {
+  fn did_close(&mut self, params: DidCloseTextDocumentParams) {
     let mark = self.performance.mark_with_args("lsp.did_close", &params);
     // `deno:` documents are read-only and should only be handled as server
     // documents.
@@ -1409,7 +1492,9 @@ impl Inner {
     {
       return;
     }
-    self.diagnostics_state.clear(&params.text_document.uri);
+    if let Some(diagnostics_server) = &self.diagnostics_server {
+      diagnostics_server.state.clear(&params.text_document.uri);
+    }
     let document = match self
       .document_modules
       .close_document(&params.text_document.uri)
@@ -1421,63 +1506,42 @@ impl Inner {
       }
     };
     if document.is_diagnosable() {
-      self.refresh_dep_info().await;
-      let changed_specifier = self
-        .document_modules
-        .primary_specifier(&Document::Open(document.clone()))
-        .map(|s| (s, ChangeKind::Closed));
-      // Invalidate the weak references of `document` before calling
-      // `self.project_changed()` so its module entries will be dropped.
-      drop(document);
-      self.project_changed(changed_specifier, ProjectScopesChange::None);
-      self
-        .diagnostics_server
-        .invalidate(&[&params.text_document.uri]);
+      self.refresh_dep_info();
+      self.project_changed(
+        vec![(Document::Open(document), ChangeKind::Closed)],
+        ProjectScopesChange::None,
+      );
       self.send_diagnostics_update();
       self.send_testing_update();
     }
     self.performance.measure(mark);
   }
 
-  async fn notebook_did_open(&mut self, params: DidOpenNotebookDocumentParams) {
+  fn notebook_did_open(&mut self, params: DidOpenNotebookDocumentParams) {
     let _mark = self.performance.measure_scope("lsp.notebook_did_open");
     let documents = self.document_modules.open_notebook_document(
       params.notebook_document.uri,
       params.cell_text_documents,
     );
     let diagnosable_documents = documents
-      .iter()
+      .into_iter()
       .filter(|d| d.is_diagnosable())
       .collect::<Vec<_>>();
     if !diagnosable_documents.is_empty() {
       self.check_semantic_tokens_capabilities();
-      self.refresh_dep_info().await;
+      self.refresh_dep_info();
       self.project_changed(
         diagnosable_documents
-          .iter()
-          .flat_map(|d| {
-            let specifier = self
-              .document_modules
-              .primary_specifier(&Document::Open((*d).clone()))?;
-            Some((specifier, ChangeKind::Closed))
-          })
-          .collect::<Vec<_>>(),
+          .into_iter()
+          .map(|d| (Document::Open(d), ChangeKind::Opened))
+          .collect(),
         ProjectScopesChange::OpenNotebooks,
-      );
-      self.diagnostics_server.invalidate(
-        &diagnosable_documents
-          .iter()
-          .map(|d| d.uri.as_ref())
-          .collect::<Vec<_>>(),
       );
       self.send_diagnostics_update();
     }
   }
 
-  async fn notebook_did_change(
-    &mut self,
-    params: DidChangeNotebookDocumentParams,
-  ) {
+  fn notebook_did_change(&mut self, params: DidChangeNotebookDocumentParams) {
     let _mark = self.performance.measure_scope("lsp.notebook_did_change");
     let Some(cells) = params.change.cells else {
       return;
@@ -1488,48 +1552,23 @@ impl Inner {
       cells.text_content,
     );
     let diagnosable_documents = documents
-      .iter()
+      .into_iter()
       .filter(|(d, _)| d.is_diagnosable())
       .collect::<Vec<_>>();
     if !diagnosable_documents.is_empty() {
-      let old_scopes_with_node_specifier =
-        self.document_modules.scopes_with_node_specifier();
-      self.refresh_dep_info().await;
-      let mut config_changed = false;
-      if !self
-        .document_modules
-        .scopes_with_node_specifier()
-        .equivalent(&old_scopes_with_node_specifier)
-      {
-        config_changed = true;
-      }
+      self.refresh_dep_info();
       self.project_changed(
         diagnosable_documents
-          .iter()
-          .flat_map(|(d, k)| {
-            let specifier = self
-              .document_modules
-              .primary_specifier(&Document::Open(d.clone()))?;
-            Some((specifier, *k))
-          })
-          .collect::<Vec<_>>(),
-        if config_changed {
-          ProjectScopesChange::Config
-        } else {
-          ProjectScopesChange::None
-        },
-      );
-      self.diagnostics_server.invalidate(
-        &diagnosable_documents
-          .iter()
-          .map(|(d, _)| d.uri.as_ref())
-          .collect::<Vec<_>>(),
+          .into_iter()
+          .map(|(d, k)| (Document::Open(d), k))
+          .collect(),
+        ProjectScopesChange::None,
       );
       self.send_diagnostics_update();
     }
   }
 
-  fn notebook_did_save(&mut self, params: DidSaveNotebookDocumentParams) {
+  async fn notebook_did_save(&self, params: DidSaveNotebookDocumentParams) {
     let _mark = self.performance.measure_scope("lsp.notebook_did_save");
     let Some(cell_uris) = self
       .document_modules
@@ -1545,46 +1584,34 @@ impl Inner {
       return;
     };
     for cell_uri in cell_uris {
-      self.did_save(DidSaveTextDocumentParams {
-        text_document: TextDocumentIdentifier {
-          uri: cell_uri.as_ref().clone(),
-        },
-        text: None,
-      });
+      self
+        .did_save(DidSaveTextDocumentParams {
+          text_document: TextDocumentIdentifier {
+            uri: cell_uri.as_ref().clone(),
+          },
+          text: None,
+        })
+        .await;
     }
   }
 
-  async fn notebook_did_close(
-    &mut self,
-    params: DidCloseNotebookDocumentParams,
-  ) {
+  fn notebook_did_close(&mut self, params: DidCloseNotebookDocumentParams) {
     let _mark = self.performance.measure_scope("lsp.notebook_did_close");
     let documents = self
       .document_modules
       .close_notebook_document(&params.notebook_document.uri);
     let diagnosable_documents = documents
-      .iter()
+      .into_iter()
       .filter(|d| d.is_diagnosable())
       .collect::<Vec<_>>();
     if !diagnosable_documents.is_empty() {
-      self.refresh_dep_info().await;
+      self.refresh_dep_info();
       self.project_changed(
         diagnosable_documents
-          .iter()
-          .flat_map(|d| {
-            let specifier = self
-              .document_modules
-              .primary_specifier(&Document::Open((*d).clone()))?;
-            Some((specifier, ChangeKind::Closed))
-          })
-          .collect::<Vec<_>>(),
+          .into_iter()
+          .map(|d| (Document::Open(d), ChangeKind::Closed))
+          .collect(),
         ProjectScopesChange::OpenNotebooks,
-      );
-      self.diagnostics_server.invalidate(
-        &diagnosable_documents
-          .iter()
-          .map(|d| d.uri.as_ref())
-          .collect::<Vec<_>>(),
       );
       self.send_diagnostics_update();
     }
@@ -1618,8 +1645,10 @@ impl Inner {
     self.refresh_config_tree().await;
     self.update_cache();
     self.refresh_resolver().await;
-    self.refresh_documents_config().await;
-    self.diagnostics_server.invalidate_all();
+    self.refresh_compiler_options_resolver();
+    self.dispatch_cache_jsx_import_sources();
+    self.refresh_linter_resolver();
+    self.refresh_documents_config();
     self.send_diagnostics_update();
     self.send_testing_update();
   }
@@ -1643,10 +1672,12 @@ impl Inner {
       .any(|(s, _)| self.config.tree.is_watched_file(s))
     {
       let mut deno_config_changes = IndexSet::with_capacity(changes.len());
+      let mut changed_deno_json = false;
       deno_config_changes.extend(changes.iter().filter_map(|(s, e)| {
         self.config.tree.watched_file_type(s).and_then(|t| {
           let configuration_type = match t.1 {
             ConfigWatchedFileType::DenoJson => {
+              changed_deno_json = true;
               lsp_custom::DenoConfigurationType::DenoJson
             }
             ConfigWatchedFileType::PackageJson => {
@@ -1669,25 +1700,31 @@ impl Inner {
       self.refresh_config_tree().await;
       self.update_cache();
       self.refresh_resolver().await;
-      self.refresh_documents_config().await;
+      self.refresh_compiler_options_resolver();
+      // Don't cache anything if only a lockfile has changed, or it can
+      // retrigger this notification and cause an infinite loop.
+      if changed_deno_json {
+        self.dispatch_cache_jsx_import_sources();
+      }
+      self.refresh_linter_resolver();
+      self.refresh_documents_config();
       self.project_changed(
         changes
           .iter()
           .filter_map(|(_, e)| {
             let document = self.document_modules.documents.inspect(&e.uri)?;
-            if !document.is_diagnosable() {
-              return None;
-            }
-            let specifier =
-              self.document_modules.primary_specifier(&document)?;
-            Some((specifier, ChangeKind::Modified))
+            Some((document, ChangeKind::Modified))
           })
           .collect::<Vec<_>>(),
         ProjectScopesChange::None,
       );
       self.ts_server.cleanup_semantic_cache(self.snapshot()).await;
-      self.diagnostics_server.invalidate_all();
       self.send_diagnostics_update();
+      if self.config.diagnostic_capable()
+        && self.config.diagnostic_refresh_capable()
+      {
+        self.client.refresh_diagnostics();
+      }
       self.send_testing_update();
       deno_config_changes.extend(changes.iter().filter_map(|(s, e)| {
         self.config.tree.watched_file_type(s).and_then(|t| {
@@ -1824,7 +1861,7 @@ impl Inner {
           .and_then(|d| d.parsed_source.as_ref())
         {
           Some(Ok(parsed_source)) => {
-            format_parsed_source(parsed_source, &fmt_options)
+            format_parsed_source(parsed_source, &fmt_options, &unstable_options)
           }
           Some(Err(err)) => Err(anyhow!("{:#}", err)),
           None => {
@@ -1833,7 +1870,10 @@ impl Inner {
             });
             format_file(
               &file_path,
-              &document.text(),
+              &crate::tools::fmt::FileContents {
+                text: Cow::Borrowed(document.text().as_ref()),
+                had_bom: false,
+              },
               &fmt_options,
               &unstable_options,
               ext,
@@ -1892,9 +1932,11 @@ impl Inner {
       .dependency_at_position(&params.text_document_position_params.position)
     {
       let dep_module = dep.get_code().and_then(|s| {
-        self
-          .document_modules
-          .inspect_module_for_specifier(s, module.scope.as_deref())
+        self.document_modules.module_for_specifier(
+          s,
+          module.scope.as_deref(),
+          Some(&module.compiler_options_key),
+        )
       });
       let dep_types_dependency = dep_module.as_ref().map(|m| {
         m.types_dependency
@@ -1902,35 +1944,48 @@ impl Inner {
           .map(|d| &d.dependency)
           .unwrap_or(&Resolution::None)
       });
-      let value = match (dep.maybe_code.is_none(), dep.maybe_type.is_none(), &dep_types_dependency) {
+      let value = match (
+        dep.maybe_code.is_none(),
+        dep.maybe_type.is_none(),
+        &dep_types_dependency,
+      ) {
         (false, false, None) => format!(
           "**Resolved Dependency**\n\n**Code**: {}\n\n**Types**: {}\n",
-          self.resolution_to_hover_text(&dep.maybe_code, module.scope.as_deref()),
-          self.resolution_to_hover_text(&dep.maybe_type, module.scope.as_deref()),
+          self
+            .resolution_to_hover_text(&dep.maybe_code, module.scope.as_deref()),
+          self
+            .resolution_to_hover_text(&dep.maybe_type, module.scope.as_deref()),
         ),
         (false, false, Some(types_dep)) if !types_dep.is_none() => format!(
           "**Resolved Dependency**\n\n**Code**: {}\n**Types**: {}\n**Import Types**: {}\n",
-          self.resolution_to_hover_text(&dep.maybe_code, module.scope.as_deref()),
-          self.resolution_to_hover_text(&dep.maybe_type, module.scope.as_deref()),
+          self
+            .resolution_to_hover_text(&dep.maybe_code, module.scope.as_deref()),
+          self
+            .resolution_to_hover_text(&dep.maybe_type, module.scope.as_deref()),
           self.resolution_to_hover_text(types_dep, module.scope.as_deref()),
         ),
         (false, false, Some(_)) => format!(
           "**Resolved Dependency**\n\n**Code**: {}\n\n**Types**: {}\n",
-          self.resolution_to_hover_text(&dep.maybe_code, module.scope.as_deref()),
-          self.resolution_to_hover_text(&dep.maybe_type, module.scope.as_deref()),
+          self
+            .resolution_to_hover_text(&dep.maybe_code, module.scope.as_deref()),
+          self
+            .resolution_to_hover_text(&dep.maybe_type, module.scope.as_deref()),
         ),
         (false, true, Some(types_dep)) if !types_dep.is_none() => format!(
           "**Resolved Dependency**\n\n**Code**: {}\n\n**Types**: {}\n",
-          self.resolution_to_hover_text(&dep.maybe_code, module.scope.as_deref()),
+          self
+            .resolution_to_hover_text(&dep.maybe_code, module.scope.as_deref()),
           self.resolution_to_hover_text(types_dep, module.scope.as_deref()),
         ),
         (false, true, _) => format!(
           "**Resolved Dependency**\n\n**Code**: {}\n",
-          self.resolution_to_hover_text(&dep.maybe_code, module.scope.as_deref()),
+          self
+            .resolution_to_hover_text(&dep.maybe_code, module.scope.as_deref()),
         ),
         (true, false, _) => format!(
           "**Resolved Dependency**\n\n**Types**: {}\n",
-          self.resolution_to_hover_text(&dep.maybe_type, module.scope.as_deref()),
+          self
+            .resolution_to_hover_text(&dep.maybe_type, module.scope.as_deref()),
         ),
         (true, true, _) => unreachable!("{}", json!(params)),
       };
@@ -1953,14 +2008,7 @@ impl Inner {
         .offset_tsc(params.text_document_position_params.position)?;
       let maybe_quick_info = self
         .ts_server
-        .get_quick_info(
-          self.snapshot(),
-          &module.specifier,
-          position,
-          module.scope.as_ref(),
-          module.notebook_uri.as_ref(),
-          token,
-        )
+        .get_quick_info(self.snapshot(), &module, position, token)
         .await
         .map_err(|err| {
           if token.is_cancelled() {
@@ -1977,7 +2025,6 @@ impl Inner {
   }
 
   #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
-
   fn resolution_to_hover_text(
     &self,
     resolution: &Resolution,
@@ -2068,9 +2115,15 @@ impl Inner {
       .collect();
     let mut code_actions = CodeActionCollection::default();
     if !fixable_diagnostics.is_empty() {
-      let file_diagnostics = self
-        .diagnostics_server
-        .get_ts_diagnostics(document.uri(), document.open().map(|d| d.version));
+      let file_diagnostics =
+        if let Some(diagnostics_server) = &self.diagnostics_server {
+          diagnostics_server.state.ts_diagnostics(document.uri())
+        } else {
+          self
+            .get_module_diagnostics(&module, token)
+            .await
+            .unwrap_or_default()
+        };
       let mut includes_no_cache = false;
       for diagnostic in &fixable_diagnostics {
         match diagnostic.source.as_deref() {
@@ -2090,22 +2143,10 @@ impl Inner {
               .ts_server
               .get_code_fixes(
                 self.snapshot(),
-                &module.specifier,
+                &module,
                 module.line_index.offset_tsc(diagnostic.range.start)?
                   ..module.line_index.offset_tsc(diagnostic.range.end)?,
                 codes,
-                (&self
-                  .config
-                  .tree
-                  .fmt_config_for_specifier(&module.specifier)
-                  .options)
-                  .into(),
-                tsc::UserPreferences::from_config_for_specifier(
-                  &self.config,
-                  &module.specifier,
-                ),
-                module.scope.as_ref(),
-                module.notebook_uri.as_ref(),
                 token,
               )
               .await
@@ -2174,7 +2215,31 @@ impl Inner {
       }
       if includes_no_cache {
         let no_cache_diagnostics =
-          self.diagnostics_state.no_cache_diagnostics(document.uri());
+          if let Some(diagnostics_server) = &self.diagnostics_server {
+            diagnostics_server
+              .state
+              .no_cache_diagnostics(document.uri())
+          } else {
+            Arc::new(
+              self
+                .get_module_diagnostics(&module, token)
+                .await
+                .ok()
+                .iter()
+                .flat_map(|d| d.iter())
+                .filter(|d| {
+                  let Some(NumberOrString::String(code)) = &d.code else {
+                    return false;
+                  };
+                  matches!(
+                    code.as_str(),
+                    "no-cache" | "not-installed-jsr" | "not-installed-npm"
+                  )
+                })
+                .cloned()
+                .collect::<Vec<_>>(),
+            )
+          };
         let uncached_deps = no_cache_diagnostics
           .iter()
           .filter_map(|d| {
@@ -2188,7 +2253,7 @@ impl Inner {
         if uncached_deps.len() > 1 {
           code_actions.add_cache_all_action(
             &module.specifier,
-            no_cache_diagnostics.to_owned(),
+            no_cache_diagnostics.as_ref().clone(),
           );
         }
       }
@@ -2208,17 +2273,11 @@ impl Inner {
       .ts_server
       .get_applicable_refactors(
         self.snapshot(),
-        &module.specifier,
+        &module,
         module.line_index.offset_tsc(params.range.start)?
           ..module.line_index.offset_tsc(params.range.end)?,
-        Some(tsc::UserPreferences::from_config_for_specifier(
-          &self.config,
-          &module.specifier,
-        )),
         params.context.trigger_kind,
         only,
-        module.scope.as_ref(),
-        module.notebook_uri.as_ref(),
         token,
       )
       .await
@@ -2306,20 +2365,8 @@ impl Inner {
         .ts_server
         .get_combined_code_fix(
           self.snapshot(),
-          &module.specifier,
+          &module,
           &code_action_data.fix_id,
-          (&self
-            .config
-            .tree
-            .fmt_config_for_specifier(&module.specifier)
-            .options)
-            .into(),
-          tsc::UserPreferences::from_config_for_specifier(
-            &self.config,
-            &module.specifier,
-          ),
-          module.scope.as_ref(),
-          module.notebook_uri.as_ref(),
           token,
         )
         .await
@@ -2387,23 +2434,11 @@ impl Inner {
         .ts_server
         .get_edits_for_refactor(
           self.snapshot(),
-          &module.specifier,
-          (&self
-            .config
-            .tree
-            .fmt_config_for_specifier(&module.specifier)
-            .options)
-            .into(),
+          &module,
           module.line_index.offset_tsc(action_data.range.start)?
             ..module.line_index.offset_tsc(action_data.range.end)?,
           action_data.refactor_name.clone(),
           action_data.action_name.clone(),
-          Some(tsc::UserPreferences::from_config_for_specifier(
-            &self.config,
-            &module.specifier,
-          )),
-          module.scope.as_ref(),
-          module.notebook_uri.as_ref(),
           token,
         )
         .await
@@ -2445,7 +2480,11 @@ impl Inner {
           if token.is_cancelled() {
             return Err(LspError::request_cancelled());
           } else {
-            lsp_warn!("Unable to get refactor edit info from TypeScript: {:#}\nCode action data: {:#}", err, json!(&action_data));
+            lsp_warn!(
+              "Unable to get refactor edit info from TypeScript: {:#}\nCode action data: {:#}",
+              err,
+              json!(&action_data)
+            );
           }
         }
       }
@@ -2462,17 +2501,10 @@ impl Inner {
   pub fn get_ts_response_import_mapper(
     &self,
     module: &DocumentModule,
-  ) -> TsResponseImportMapper {
+  ) -> TsResponseImportMapper<'_> {
     TsResponseImportMapper::new(
       &self.document_modules,
       module.scope.clone(),
-      self
-        .config
-        .tree
-        .data_for_specifier(&module.specifier)
-        // todo(dsherret): this should probably just take the resolver itself
-        // as the import map is an implementation detail
-        .and_then(|d| d.resolver.maybe_import_map()),
       &self.resolver,
       &self.ts_server.specifier_map,
     )
@@ -2503,27 +2535,25 @@ impl Inner {
     let mut code_lenses = Vec::new();
     if settings.code_lens.test
       && self.config.specifier_enabled_for_test(&module.specifier)
-    {
-      if let Some(Ok(parsed_source)) = &module
+      && let Some(Ok(parsed_source)) = &module
         .open_data
         .as_ref()
         .and_then(|d| d.parsed_source.as_ref())
-      {
-        code_lenses.extend(
-          code_lens::collect_test(&module.specifier, parsed_source, token)
-            .map_err(|err| {
-              if token.is_cancelled() {
-                LspError::request_cancelled()
-              } else {
-                error!(
-                  "Error getting test code lenses for \"{}\": {:#}",
-                  &module.specifier, err
-                );
-                LspError::internal_error()
-              }
-            })?,
-        );
-      }
+    {
+      code_lenses.extend(
+        code_lens::collect_test(&module.specifier, parsed_source, token)
+          .map_err(|err| {
+            if token.is_cancelled() {
+              LspError::request_cancelled()
+            } else {
+              error!(
+                "Error getting test code lenses for \"{}\": {:#}",
+                &module.specifier, err
+              );
+              LspError::internal_error()
+            }
+          })?,
+      );
     }
     if settings.code_lens.implementations || settings.code_lens.references {
       let navigation_tree = self.get_navigation_tree(&module, token).await?;
@@ -2610,13 +2640,10 @@ impl Inner {
       .ts_server
       .get_document_highlights(
         self.snapshot(),
-        &module.specifier,
+        &module,
         module
           .line_index
           .offset_tsc(params.text_document_position_params.position)?,
-        vec![module.specifier.as_ref().clone()],
-        module.scope.as_ref(),
-        module.notebook_uri.as_ref(),
         token,
       )
       .await
@@ -2672,9 +2699,10 @@ impl Inner {
       return Ok(None);
     };
     let mut locations = IndexSet::new();
-    for (scope, module) in self
+    for module in self
       .document_modules
-      .inspect_or_temp_modules_by_scope(&document)
+      .get_or_temp_modules_by_compiler_options_key(&document)
+      .into_values()
     {
       if token.is_cancelled() {
         return Err(LspError::request_cancelled());
@@ -2683,13 +2711,10 @@ impl Inner {
         .ts_server
         .find_references(
           self.snapshot(),
-          &module.specifier,
+          &module,
           module
             .line_index
             .offset_tsc(params.text_document_position.position)?,
-          scope.as_ref(),
-          // TODO(nayeemrmn): Support notebook scopes here.
-          None,
           token,
         )
         .await
@@ -2751,12 +2776,10 @@ impl Inner {
       .ts_server
       .get_definition(
         self.snapshot(),
-        &module.specifier,
+        &module,
         module
           .line_index
           .offset_tsc(params.text_document_position_params.position)?,
-        module.scope.as_ref(),
-        module.notebook_uri.as_ref(),
         token,
       )
       .await
@@ -2814,12 +2837,10 @@ impl Inner {
       .ts_server
       .get_type_definition(
         self.snapshot(),
-        &module.specifier,
+        &module,
         module
           .line_index
           .offset_tsc(params.text_document_position_params.position)?,
-        module.scope.as_ref(),
-        module.notebook_uri.as_ref(),
         token,
       )
       .await
@@ -2899,26 +2920,10 @@ impl Inner {
         &self.npm_search_api,
         &self.document_modules,
         self.resolver.as_ref(),
-        self
-          .config
-          .tree
-          .data_for_specifier(&module.specifier)
-          // todo(dsherret): this should probably just take the resolver itself
-          // as the import map is an implementation detail
-          .and_then(|d| d.resolver.maybe_import_map()),
       )
       .await;
     }
     if response.is_none() {
-      let (trigger_character, trigger_kind) =
-        if let Some(context) = &params.context {
-          (
-            context.trigger_character.clone(),
-            Some(context.trigger_kind.into()),
-          )
-        } else {
-          (None, None)
-        };
       let position = module
         .line_index
         .offset_tsc(params.text_document_position.position)?;
@@ -2926,24 +2931,13 @@ impl Inner {
         .ts_server
         .get_completions(
           self.snapshot(),
-          &module.specifier,
+          &module,
           position,
-          tsc::GetCompletionsAtPositionOptions {
-            user_preferences: tsc::UserPreferences::from_config_for_specifier(
-              &self.config,
-              &module.specifier,
-            ),
-            trigger_character,
-            trigger_kind,
-          },
-          (&self
-            .config
-            .tree
-            .fmt_config_for_specifier(&module.specifier)
-            .options)
-            .into(),
-          module.scope.as_ref(),
-          module.notebook_uri.as_ref(),
+          params
+            .context
+            .as_ref()
+            .and_then(|c| c.trigger_character.clone()),
+          params.context.as_ref().map(|c| c.trigger_kind.into()),
           token,
         )
         .await
@@ -3019,25 +3013,11 @@ impl Inner {
           .ts_server
           .get_completion_details(
             self.snapshot(),
-            &module.specifier,
+            &module,
             data.position,
             data.name.clone(),
-            Some(
-              (&self
-                .config
-                .tree
-                .fmt_config_for_specifier(&module.specifier)
-                .options)
-                .into(),
-            ),
             data.source.clone(),
-            Some(tsc::UserPreferences::from_config_for_specifier(
-              &self.config,
-              &module.specifier,
-            )),
             data.data.clone(),
-            module.scope.as_ref(),
-            module.notebook_uri.as_ref(),
             token,
           )
           .await;
@@ -3086,6 +3066,119 @@ impl Inner {
     Ok(completion_item)
   }
 
+  async fn diagnostic(
+    &self,
+    params: DocumentDiagnosticParams,
+    token: &CancellationToken,
+  ) -> LspResult<DocumentDiagnosticReportResult> {
+    let _mark = self.performance.measure_scope("lsp.diagnostic");
+    if params
+      .previous_result_id
+      .as_ref()
+      .and_then(|i| i.parse::<usize>().ok())
+      .is_some_and(|i| i >= self.project_version)
+    {
+      return Ok(DocumentDiagnosticReportResult::Report(
+        DocumentDiagnosticReport::Unchanged(
+          RelatedUnchangedDocumentDiagnosticReport {
+            related_documents: None,
+            unchanged_document_diagnostic_report:
+              UnchangedDocumentDiagnosticReport {
+                result_id: self.project_version.to_string(),
+              },
+          },
+        ),
+      ));
+    }
+    let empty_result = || {
+      DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(
+        RelatedFullDocumentDiagnosticReport {
+          related_documents: None,
+          full_document_diagnostic_report: FullDocumentDiagnosticReport {
+            result_id: Some(self.project_version.to_string()),
+            items: Vec::new(),
+          },
+        },
+      ))
+    };
+    let Some(document) = self.get_document(
+      &params.text_document.uri,
+      Enabled::Filter,
+      Exists::Enforce,
+      Diagnosable::Filter,
+    )?
+    else {
+      return Ok(empty_result());
+    };
+    let module = match self.get_primary_module(&document)? {
+      Some(module) => module,
+      None => {
+        let url = uri_to_url(document.uri());
+        if url.scheme() == "file"
+          && !self.resolver.in_node_modules(&url)
+          && !self.cache.in_cache_directory(&url)
+        {
+          return Ok(empty_result());
+        }
+        // If this document represents a non-local module, the module may not be
+        // retrievable until its referrer is known through some other request.
+        // Wait and try one more time.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let Some(module) = self.get_primary_module(&document)? else {
+          return Ok(empty_result());
+        };
+        module
+      }
+    };
+    let diagnostics = self.get_module_diagnostics(&module, token).await?;
+    Ok(DocumentDiagnosticReportResult::Report(
+      DocumentDiagnosticReport::Full(RelatedFullDocumentDiagnosticReport {
+        related_documents: None,
+        full_document_diagnostic_report: FullDocumentDiagnosticReport {
+          result_id: Some(self.project_version.to_string()),
+          items: diagnostics.as_ref().clone(),
+        },
+      }),
+    ))
+  }
+
+  async fn get_module_diagnostics(
+    &self,
+    module: &Arc<DocumentModule>,
+    token: &CancellationToken,
+  ) -> Result<Arc<Vec<Diagnostic>>, LspError> {
+    let diagnostics_cell = self
+      .diagnostics_cache
+      .entry(module.uri.clone())
+      .or_default()
+      .clone();
+    diagnostics_cell
+      .get_or_try_init(async || {
+        let diagnostics = generate_module_diagnostics(
+          module,
+          &self.snapshot(),
+          &self.ts_server,
+          &self.ambient_modules_regex_cache,
+          token,
+        )
+        .await
+        .map_err(|err| {
+          if token.is_cancelled() {
+            LspError::request_cancelled()
+          } else {
+            error!(
+              "Unable to generate diagnostics for \"{}\": {:#}",
+              &module.specifier, err
+            );
+            LspError::internal_error()
+          }
+        })?;
+        Ok(Arc::new(diagnostics))
+      })
+      .await
+      .cloned()
+  }
+
   #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
   pub async fn goto_implementation(
     &self,
@@ -3105,9 +3198,10 @@ impl Inner {
       return Ok(None);
     };
     let mut implementations_with_modules = IndexMap::new();
-    for (scope, module) in self
+    for module in self
       .document_modules
-      .inspect_or_temp_modules_by_scope(&document)
+      .get_or_temp_modules_by_compiler_options_key(&document)
+      .into_values()
     {
       if token.is_cancelled() {
         return Err(LspError::request_cancelled());
@@ -3116,12 +3210,10 @@ impl Inner {
         .ts_server
         .get_implementations(
           self.snapshot(),
-          &module.specifier,
+          &module,
           module
             .line_index
             .offset_tsc(params.text_document_position_params.position)?,
-          scope.as_ref(),
-          module.notebook_uri.as_ref(),
           token,
         )
         .await
@@ -3184,13 +3276,7 @@ impl Inner {
     };
     let outlining_spans = self
       .ts_server
-      .get_outlining_spans(
-        self.snapshot(),
-        &module.specifier,
-        module.scope.as_ref(),
-        module.notebook_uri.as_ref(),
-        token,
-      )
+      .get_outlining_spans(self.snapshot(), &module, token)
       .await
       .map_err(|err| {
         if token.is_cancelled() {
@@ -3242,9 +3328,10 @@ impl Inner {
       return Ok(None);
     };
     let mut incoming_calls_with_modules = IndexMap::new();
-    for (scope, module) in self
+    for module in self
       .document_modules
-      .inspect_or_temp_modules_by_scope(&document)
+      .get_or_temp_modules_by_compiler_options_key(&document)
+      .into_values()
     {
       if token.is_cancelled() {
         return Err(LspError::request_cancelled());
@@ -3253,12 +3340,10 @@ impl Inner {
         .ts_server
         .provide_call_hierarchy_incoming_calls(
           self.snapshot(),
-          &module.specifier,
+          &module,
           module
             .line_index
             .offset_tsc(params.item.selection_range.start)?,
-          scope.as_ref(),
-          module.notebook_uri.as_ref(),
           token,
         )
         .await
@@ -3321,12 +3406,10 @@ impl Inner {
       .ts_server
       .provide_call_hierarchy_outgoing_calls(
         self.snapshot(),
-        &module.specifier,
+        &module,
         module
           .line_index
           .offset_tsc(params.item.selection_range.start)?,
-        module.scope.as_ref(),
-        module.notebook_uri.as_ref(),
         token,
       )
       .await
@@ -3384,12 +3467,10 @@ impl Inner {
       .ts_server
       .prepare_call_hierarchy(
         self.snapshot(),
-        &module.specifier,
+        &module,
         module
           .line_index
           .offset_tsc(params.text_document_position_params.position)?,
-        module.scope.as_ref(),
-        module.notebook_uri.as_ref(),
         token,
       )
       .await
@@ -3458,9 +3539,10 @@ impl Inner {
       return Ok(None);
     };
     let mut locations_with_modules = IndexMap::new();
-    for (scope, module) in self
+    for module in self
       .document_modules
-      .inspect_or_temp_modules_by_scope(&document)
+      .get_or_temp_modules_by_compiler_options_key(&document)
+      .into_values()
     {
       if token.is_cancelled() {
         return Err(LspError::request_cancelled());
@@ -3469,17 +3551,10 @@ impl Inner {
         .ts_server
         .find_rename_locations(
           self.snapshot(),
-          &module.specifier,
+          &module,
           module
             .line_index
             .offset_tsc(params.text_document_position.position)?,
-          tsc::UserPreferences::from_config_for_specifier(
-            &self.config,
-            &module.specifier,
-          ),
-          scope.as_ref(),
-          // TODO(nayeemrmn): Support notebook scopes here.
-          None,
           token,
         )
         .await
@@ -3488,7 +3563,7 @@ impl Inner {
             lsp_warn!(
               "Unable to get rename locations from TypeScript: {:#}\nScope: {}",
               err,
-              scope.as_ref().map(|s| s.as_str()).unwrap_or("null"),
+              module.scope.as_ref().map(|s| s.as_str()).unwrap_or("null"),
             );
           }
         })
@@ -3553,10 +3628,8 @@ impl Inner {
         .ts_server
         .get_smart_selection_range(
           self.snapshot(),
-          &module.specifier,
+          &module,
           module.line_index.offset_tsc(position)?,
-          module.scope.as_ref(),
-          module.notebook_uri.as_ref(),
           token,
         )
         .await
@@ -3607,10 +3680,8 @@ impl Inner {
           .ts_server
           .get_encoded_semantic_classifications(
             self.snapshot(),
-            &module.specifier,
+            &module,
             0..module.line_index.text_content_length_utf16().into(),
-            module.scope.as_ref(),
-            module.notebook_uri.as_ref(),
             token,
           )
           .await
@@ -3675,11 +3746,9 @@ impl Inner {
       .ts_server
       .get_encoded_semantic_classifications(
         self.snapshot(),
-        &module.specifier,
+        &module,
         module.line_index.offset_tsc(params.range.start)?
           ..module.line_index.offset_tsc(params.range.end)?,
-        module.scope.as_ref(),
-        module.notebook_uri.as_ref(),
         token,
       )
       .await
@@ -3742,13 +3811,11 @@ impl Inner {
       .ts_server
       .get_signature_help_items(
         self.snapshot(),
-        &module.specifier,
+        &module,
         module
           .line_index
           .offset_tsc(params.text_document_position_params.position)?,
         options,
-        module.scope.as_ref(),
-        module.notebook_uri.as_ref(),
         token,
       )
       .await
@@ -3803,9 +3870,10 @@ impl Inner {
       else {
         continue;
       };
-      for (scope, module) in self
+      for module in self
         .document_modules
-        .inspect_or_temp_modules_by_scope(&document)
+        .get_or_temp_modules_by_compiler_options_key(&document)
+        .into_values()
       {
         if token.is_cancelled() {
           return Err(LspError::request_cancelled());
@@ -3820,26 +3888,12 @@ impl Inner {
         if options.enabled == UpdateImportsOnFileMoveEnabled::Never {
           continue;
         }
-        let format_code_settings = (&self
-          .config
-          .tree
-          .fmt_config_for_specifier(&module.specifier)
-          .options)
-          .into();
         let changes = self
         .ts_server
         .get_edits_for_file_rename(
           self.snapshot(),
-          &module.specifier,
+          &module,
           &uri_to_url(&Uri::from_str(&rename.new_uri).unwrap()),
-          format_code_settings,
-          tsc::UserPreferences {
-            allow_text_changes_in_new_files: Some(true),
-            ..Default::default()
-          },
-          scope.as_ref(),
-          // TODO(nayeemrmn): Support notebook scopes here.
-          None,
           token,
         )
         .await
@@ -3850,13 +3904,30 @@ impl Inner {
             lsp_warn!(
               "Unable to get edits for file rename from TypeScript: {:#}\nScope: {}",
               err,
-              scope.as_ref().map(|s| s.as_str()).unwrap_or("null"),
+              module.scope.as_ref().map(|s| s.as_str()).unwrap_or("null"),
             );
             LspError::internal_error()
           }
         })?;
-        changes_with_modules
-          .extend(changes.into_iter().map(|c| (c, module.clone())));
+        let changes = fix_ts_import_changes_for_file_rename(
+          changes,
+          &rename.new_uri,
+          &module,
+          self,
+          token,
+        )
+        .map_err(|err| {
+          if token.is_cancelled() {
+            LspError::request_cancelled()
+          } else {
+            error!("Unable to fix import changes: {:#}", err);
+            LspError::internal_error()
+          }
+        })?;
+        if !changes.is_empty() {
+          changes_with_modules
+            .extend(changes.into_iter().map(|c| (c, module.clone())));
+        }
       }
     }
     file_text_changes_to_workspace_edit(&changes_with_modules, self, token)
@@ -3874,7 +3945,13 @@ impl Inner {
 
     let mark = self.performance.mark_with_args("lsp.symbol", &params);
     let mut items_with_scopes = IndexMap::new();
-    for scope in self.document_modules.scopes() {
+    for (compiler_options_key, compiler_options_data) in
+      self.compiler_options_resolver.entries()
+    {
+      let scope = compiler_options_data
+        .workspace_dir_or_source_url
+        .as_ref()
+        .and_then(|s| self.config.tree.scope_for_specifier(s));
       if token.is_cancelled() {
         return Err(LspError::request_cancelled());
       }
@@ -3885,8 +3962,8 @@ impl Inner {
           params.query.clone(),
           // this matches vscode's hard coded result count
           Some(256),
-          None,
-          scope.as_ref(),
+          compiler_options_key,
+          scope,
           // TODO(nayeemrmn): Support notebook scopes here.
           None,
           token,
@@ -3896,19 +3973,27 @@ impl Inner {
           lsp_warn!(
             "Unable to get signature help items from TypeScript: {:#}\nScope: {}",
             err,
-            scope.as_ref().map(|s| s.as_str()).unwrap_or("null"),
+            scope.map(|s| s.as_str()).unwrap_or("null"),
           );
         })
         .unwrap_or_default();
-      items_with_scopes.extend(items.into_iter().map(|i| (i, scope.clone())));
+      items_with_scopes.extend(
+        items
+          .into_iter()
+          .map(|i| (i, (scope, compiler_options_key))),
+      );
     }
     let symbol_information = items_with_scopes
       .into_iter()
-      .flat_map(|(item, scope)| {
+      .flat_map(|(item, (scope, compiler_options_key))| {
         if token.is_cancelled() {
           return Some(Err(LspError::request_cancelled()));
         }
-        Some(Ok(item.to_symbol_information(scope.as_deref(), self)?))
+        Some(Ok(item.to_symbol_information(
+          scope.map(|s| s.as_ref()),
+          compiler_options_key,
+          self,
+        )?))
       })
       .collect::<Result<Vec<_>, _>>()?;
     let symbol_information = if symbol_information.is_empty() {
@@ -3921,23 +4006,22 @@ impl Inner {
   }
 
   #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
-  fn project_changed<'a>(
+  fn project_changed(
     &mut self,
-    changed_specifiers: impl IntoIterator<Item = (Arc<Url>, ChangeKind)>,
+    documents: Vec<(Document, ChangeKind)>,
     scopes_change: ProjectScopesChange,
   ) {
+    self.ambient_modules_regex_cache.clear();
+    self.diagnostics_cache.clear();
     self.project_version += 1; // increment before getting the snapshot
-    let changed_specifiers = changed_specifiers.into_iter().collect::<Vec<_>>();
     self.ts_server.project_changed(
       self.snapshot(),
-      changed_specifiers.iter().map(|(u, k)| (u.as_ref(), *k)),
+      &documents,
       matches!(scopes_change, ProjectScopesChange::Config).then(|| {
         self
-          .config
-          .tree
-          .data_by_scope()
-          .iter()
-          .map(|(s, d)| (s.clone(), d.ts_config.clone()))
+          .compiler_options_resolver
+          .entries()
+          .map(|(k, d)| (k.clone(), d.compiler_options.clone()))
           .collect()
       }),
       matches!(
@@ -3951,34 +4035,40 @@ impl Inner {
           .cells_by_notebook_uri()
           .keys()
           .map(|u| {
-            (
-              u.clone(),
-              self.document_modules.primary_scope(u).flatten().cloned(),
-            )
+            let compiler_options_key = self
+              .compiler_options_resolver
+              .entry_for_specifier(&uri_to_url(u))
+              .0;
+            (u.clone(), compiler_options_key.clone())
           })
           .collect()
       }),
     );
+    // Invalidate the weak references of `documents` before removing expired
+    // entries.
+    drop(documents);
     self.document_modules.remove_expired_modules();
   }
 
   #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
   fn send_diagnostics_update(&self) {
-    let snapshot = DiagnosticServerUpdateMessage {
-      snapshot: self.snapshot(),
-    };
-    if let Err(err) = self.diagnostics_server.update(snapshot) {
-      error!("Cannot update diagnostics: {:#}", err);
+    if let Some(diagnostics_server) = &self.diagnostics_server {
+      let snapshot = DiagnosticsUpdateMessage {
+        snapshot: self.snapshot(),
+      };
+      if let Err(err) = diagnostics_server.update(snapshot) {
+        error!("Cannot update diagnostics: {:#}", err);
+      }
     }
   }
 
   /// Send a message to the testing server to look for any changes in tests and
   /// update the client.
   fn send_testing_update(&self) {
-    if let Some(testing_server) = &self.maybe_testing_server {
-      if let Err(err) = testing_server.update(self.snapshot()) {
-        error!("Cannot update testing server: {:#}", err);
-      }
+    if let Some(testing_server) = &self.maybe_testing_server
+      && let Err(err) = testing_server.update(self.snapshot())
+    {
+      error!("Cannot update testing server: {:#}", err);
     }
   }
 }
@@ -4004,9 +4094,10 @@ impl tower_lsp::LanguageServer for LanguageServer {
         serde_json::from_value(json!(params.arguments))
           .map_err(|err| LspError::invalid_params(err.to_string()))?;
       self
-        .cache(specifiers, referrer, options.force_global_cache)
+        .cache(specifiers, referrer, options.force_global_cache, false)
         .await
     } else if params.command == "deno.reloadImportRegistries" {
+      *self.did_change_batch_queue.borrow_mut() = None;
       self.inner.write().await.reload_import_registries().await
     } else {
       Ok(None)
@@ -4073,42 +4164,67 @@ impl tower_lsp::LanguageServer for LanguageServer {
 
   async fn did_open(&self, params: DidOpenTextDocumentParams) {
     self.init_flag.wait_raised().await;
-    self.inner.write().await.did_open(params).await;
+    *self.did_change_batch_queue.borrow_mut() = None;
+    self.inner.write().await.did_open(params);
   }
 
   async fn did_change(&self, params: DidChangeTextDocumentParams) {
     self.init_flag.wait_raised().await;
-    self.inner.write().await.did_change(params).await;
+    let (batch_queue, token) = {
+      let existing = self.did_change_batch_queue.borrow_mut().take();
+      let batch_queue = existing
+        .filter(|q| q.uri == params.text_document.uri)
+        .unwrap_or_else(|| {
+          Arc::new(DidChangeBatchQueue::new(params.text_document.uri))
+        });
+      let token = batch_queue.enqueue(DidChangeBatchQueueEntry {
+        version: params.text_document.version,
+        content_changes: params.content_changes,
+      });
+      *self.did_change_batch_queue.borrow_mut() = Some(batch_queue.clone());
+      (batch_queue, token)
+    };
+    tokio::select! {
+      biased;
+      _ = token.cancelled() => {}
+      mut inner = self.inner.write() => {
+        inner.did_change_batched(batch_queue);
+      }
+    }
   }
 
   async fn did_save(&self, params: DidSaveTextDocumentParams) {
     self.init_flag.wait_raised().await;
-    self.inner.write().await.did_save(params);
+    self.inner.read().await.did_save(params).await;
   }
 
   async fn did_close(&self, params: DidCloseTextDocumentParams) {
     self.init_flag.wait_raised().await;
-    self.inner.write().await.did_close(params).await;
+    *self.did_change_batch_queue.borrow_mut() = None;
+    self.inner.write().await.did_close(params);
   }
 
   async fn notebook_did_open(&self, params: DidOpenNotebookDocumentParams) {
     self.init_flag.wait_raised().await;
-    self.inner.write().await.notebook_did_open(params).await
+    *self.did_change_batch_queue.borrow_mut() = None;
+    self.inner.write().await.notebook_did_open(params)
   }
 
   async fn notebook_did_change(&self, params: DidChangeNotebookDocumentParams) {
     self.init_flag.wait_raised().await;
-    self.inner.write().await.notebook_did_change(params).await
+    *self.did_change_batch_queue.borrow_mut() = None;
+    self.inner.write().await.notebook_did_change(params)
   }
 
   async fn notebook_did_save(&self, params: DidSaveNotebookDocumentParams) {
     self.init_flag.wait_raised().await;
-    self.inner.write().await.notebook_did_save(params)
+    self.inner.read().await.notebook_did_save(params).await
   }
 
   async fn notebook_did_close(&self, params: DidCloseNotebookDocumentParams) {
     self.init_flag.wait_raised().await;
-    self.inner.write().await.notebook_did_close(params).await
+    *self.did_change_batch_queue.borrow_mut() = None;
+    self.inner.write().await.notebook_did_close(params)
   }
 
   async fn did_change_configuration(
@@ -4120,6 +4236,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
       .performance
       .mark_with_args("lsp.did_change_configuration", &params);
     self.refresh_configuration().await;
+    *self.did_change_batch_queue.borrow_mut() = None;
     self
       .inner
       .write()
@@ -4134,6 +4251,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     params: DidChangeWatchedFilesParams,
   ) {
     self.init_flag.wait_raised().await;
+    *self.did_change_batch_queue.borrow_mut() = None;
     self
       .inner
       .write()
@@ -4150,12 +4268,14 @@ impl tower_lsp::LanguageServer for LanguageServer {
     let mark = self
       .performance
       .mark_with_args("lsp.did_change_workspace_folders", &params);
+    *self.did_change_batch_queue.borrow_mut() = None;
     self
       .inner
       .write()
       .await
       .pre_did_change_workspace_folders(params);
     self.refresh_configuration().await;
+    *self.did_change_batch_queue.borrow_mut() = None;
     self
       .inner
       .write()
@@ -4326,6 +4446,15 @@ impl tower_lsp::LanguageServer for LanguageServer {
       .await
   }
 
+  async fn diagnostic(
+    &self,
+    params: DocumentDiagnosticParams,
+    token: CancellationToken,
+  ) -> LspResult<DocumentDiagnosticReportResult> {
+    self.init_flag.wait_raised().await;
+    self.inner.read().await.diagnostic(params, &token).await
+  }
+
   async fn goto_implementation(
     &self,
     params: GotoImplementationParams,
@@ -4482,7 +4611,10 @@ impl Inner {
     self.refresh_config_tree().await;
     self.update_cache();
     self.refresh_resolver().await;
-    self.refresh_documents_config().await;
+    self.refresh_compiler_options_resolver();
+    self.dispatch_cache_jsx_import_sources();
+    self.refresh_linter_resolver();
+    self.refresh_documents_config();
 
     if self.config.did_change_watched_files_capable() {
       // we are going to watch all the JSON files in the workspace, and the
@@ -4534,25 +4666,25 @@ impl Inner {
       let Ok(scope_uri) = url_to_uri(scope_url) else {
         continue;
       };
-      if let Some(config_file) = config_data.maybe_deno_json() {
-        if let Ok(file_uri) = url_to_uri(&config_file.specifier) {
-          config_events.push(lsp_custom::DenoConfigurationChangeEvent {
-            scope_uri: scope_uri.clone(),
-            file_uri,
-            typ: lsp_custom::DenoConfigurationChangeType::Added,
-            configuration_type: lsp_custom::DenoConfigurationType::DenoJson,
-          });
-        }
+      if let Some(config_file) = config_data.maybe_deno_json()
+        && let Ok(file_uri) = url_to_uri(&config_file.specifier)
+      {
+        config_events.push(lsp_custom::DenoConfigurationChangeEvent {
+          scope_uri: scope_uri.clone(),
+          file_uri,
+          typ: lsp_custom::DenoConfigurationChangeType::Added,
+          configuration_type: lsp_custom::DenoConfigurationType::DenoJson,
+        });
       }
-      if let Some(package_json) = config_data.maybe_pkg_json() {
-        if let Ok(file_uri) = url_to_uri(&package_json.specifier()) {
-          config_events.push(lsp_custom::DenoConfigurationChangeEvent {
-            scope_uri,
-            file_uri,
-            typ: lsp_custom::DenoConfigurationChangeType::Added,
-            configuration_type: lsp_custom::DenoConfigurationType::PackageJson,
-          });
-        }
+      if let Some(package_json) = config_data.maybe_pkg_json()
+        && let Ok(file_uri) = url_to_uri(&package_json.specifier())
+      {
+        config_events.push(lsp_custom::DenoConfigurationChangeEvent {
+          scope_uri,
+          file_uri,
+          typ: lsp_custom::DenoConfigurationChangeType::Added,
+          configuration_type: lsp_custom::DenoConfigurationType::PackageJson,
+        });
       }
     }
     if !config_events.is_empty() {
@@ -4566,12 +4698,12 @@ impl Inner {
   }
 
   #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
-
   fn prepare_cache(
     &mut self,
     specifiers: Vec<ModuleSpecifier>,
     referrer: ModuleSpecifier,
     force_global_cache: bool,
+    lockfile_skip_write: bool,
   ) -> Result<PrepareCacheResult, AnyError> {
     let config_data = self.config.tree.data_for_specifier(&referrer);
     let scope = config_data.map(|d| d.scope.clone());
@@ -4584,17 +4716,13 @@ impl Inner {
 
     if byonm {
       roots.retain(|s| s.scheme() != "npm");
-    } else if let Some(dep_info) = self
-      .document_modules
-      .dep_info_by_scope()
-      .get(&scope)
-      .cloned()
-    {
+    } else {
       // always include the npm packages since resolution of one npm package
       // might affect the resolution of other npm packages
+      let scoped_resolver = self.resolver.get_scoped_resolver(scope.as_deref());
       roots.extend(
-        dep_info
-          .npm_reqs
+        scoped_resolver
+          .npm_reqs()
           .iter()
           .map(|req| ModuleSpecifier::parse(&format!("npm:{}", req)).unwrap()),
       );
@@ -4607,6 +4735,7 @@ impl Inner {
     let mut cli_factory = CliFactory::from_flags(Arc::new(Flags {
       internal: InternalFlags {
         cache_path: Some(self.cache.deno_dir().root.clone()),
+        lockfile_skip_write,
         ..Default::default()
       },
       ca_stores: workspace_settings.certificate_stores.clone(),
@@ -4658,18 +4787,34 @@ impl Inner {
   }
 
   #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
-  async fn post_cache(&mut self) {
-    self.resolver.did_cache();
-    self.refresh_dep_info().await;
-    self.diagnostics_server.invalidate_all();
-    self.project_changed([], ProjectScopesChange::Config);
+  async fn post_cache(&mut self, did_write_lockfile: bool) {
+    if did_write_lockfile {
+      // Most of the refresh steps will happen in `did_change_watched_files()`,
+      // since the lockfile was written.
+      self.resolver.did_cache();
+      self.refresh_dep_info();
+    } else {
+      self.refresh_config_tree().await;
+      self.update_cache();
+      self.refresh_resolver().await;
+      self.refresh_compiler_options_resolver();
+      self.refresh_linter_resolver();
+      self.refresh_documents_config();
+      self.resolver.did_cache();
+      self.refresh_dep_info();
+    }
+    self.project_changed(vec![], ProjectScopesChange::Config);
     self.ts_server.cleanup_semantic_cache(self.snapshot()).await;
     self.send_diagnostics_update();
+    if self.config.diagnostic_capable()
+      && self.config.diagnostic_refresh_capable()
+    {
+      self.client.refresh_diagnostics();
+    }
     self.send_testing_update();
   }
 
   #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
-
   fn pre_did_change_workspace_folders(
     &mut self,
     params: DidChangeWorkspaceFoldersParams,
@@ -4680,10 +4825,10 @@ impl Inner {
       .into_iter()
       .map(|folder| {
         let mut url = uri_to_url(&folder.uri);
-        if !url.path().ends_with('/') {
-          if let Ok(mut path_segments) = url.path_segments_mut() {
-            path_segments.push("");
-          }
+        if !url.path().ends_with('/')
+          && let Ok(mut path_segments) = url.path_segments_mut()
+        {
+          path_segments.push("");
         }
         (Arc::new(url), folder)
       })
@@ -4704,8 +4849,10 @@ impl Inner {
     self.refresh_workspace_files();
     self.refresh_config_tree().await;
     self.refresh_resolver().await;
-    self.refresh_documents_config().await;
-    self.diagnostics_server.invalidate_all();
+    self.refresh_compiler_options_resolver();
+    self.dispatch_cache_jsx_import_sources();
+    self.refresh_linter_resolver();
+    self.refresh_documents_config();
     self.send_diagnostics_update();
     self.send_testing_update();
   }
@@ -4759,6 +4906,7 @@ impl Inner {
             command: def.command.clone(),
             source_uri: url_to_uri(&config_file.specifier)
               .map_err(|_| LspError::internal_error())?,
+            description: def.description.clone(),
           });
         }
       };
@@ -4771,6 +4919,7 @@ impl Inner {
             command: Some(command.clone()),
             source_uri: url_to_uri(&package_json.specifier())
               .map_err(|_| LspError::internal_error())?,
+            description: None,
           });
         }
       }
@@ -4810,30 +4959,28 @@ impl Inner {
           error!("Failed to convert range to text_span: {:#}", err);
           LspError::internal_error()
         })?;
-    let maybe_inlay_hints = self
+    let mut inlay_hints = self
       .ts_server
-      .provide_inlay_hints(
-        self.snapshot(),
-        &module.specifier,
-        text_span,
-        tsc::UserPreferences::from_config_for_specifier(
-          &self.config,
-          &module.specifier,
-        ),
-        module.scope.as_ref(),
-        module.notebook_uri.as_ref(),
-        token,
-      )
-      .await
-      .map_err(|err| {
-        if token.is_cancelled() {
-          LspError::request_cancelled()
-        } else {
-          error!("Unable to get inlay hints from TypeScript: {:#}", err);
-          LspError::internal_error()
-        }
-      })?;
-    let maybe_inlay_hints = maybe_inlay_hints
+      .provide_inlay_hints(self.snapshot(), &module, text_span, token)
+      .await;
+    // Silence tsc debug failures.
+    // See https://github.com/denoland/deno/issues/30455.
+    // TODO(nayeemrmn): Keeps tabs on whether this is still necessary.
+    if let Err(err) = &inlay_hints
+      && err.to_string().contains("Debug Failure")
+    {
+      lsp_warn!("Unable to get inlay hints from TypeScript: {:#}", err);
+      inlay_hints = Ok(None)
+    }
+    let inlay_hints = inlay_hints.map_err(|err| {
+      if token.is_cancelled() {
+        LspError::request_cancelled()
+      } else {
+        error!("Unable to get inlay hints from TypeScript: {:#}", err);
+        LspError::internal_error()
+      }
+    })?;
+    let inlay_hints = inlay_hints
       .map(|hints| {
         hints
           .into_iter()
@@ -4847,7 +4994,7 @@ impl Inner {
       })
       .transpose()?;
     self.performance.measure(mark);
-    Ok(maybe_inlay_hints)
+    Ok(inlay_hints)
   }
 
   async fn reload_import_registries(&mut self) -> LspResult<Option<Value>> {
@@ -4962,19 +5109,22 @@ impl Inner {
       }
 
       Some(contents)
-    } else if let Some(document) = self.get_document(
-      &params.text_document.uri,
-      Enabled::Ignore,
-      Exists::Filter,
-      Diagnosable::Ignore,
-    )? {
-      Some(document.text().to_string())
     } else {
-      lsp_warn!(
-        "The document was not found: {}",
-        params.text_document.uri.as_str()
-      );
-      None
+      match self.get_document(
+        &params.text_document.uri,
+        Enabled::Ignore,
+        Exists::Filter,
+        Diagnosable::Ignore,
+      )? {
+        Some(document) => Some(document.text().to_string()),
+        _ => {
+          lsp_warn!(
+            "The document was not found: {}",
+            params.text_document.uri.as_str()
+          );
+          None
+        }
+      }
     };
     self.performance.measure(mark);
     Ok(contents)

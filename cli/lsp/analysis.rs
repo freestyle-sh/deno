@@ -5,11 +5,13 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use deno_ast::SourceRange;
 use deno_ast::SourceRangedForSpanned;
 use deno_ast::SourceTextInfo;
+use deno_core::ModuleSpecifier;
 use deno_core::anyhow::anyhow;
 use deno_core::error::AnyError;
 use deno_core::resolve_url;
@@ -17,13 +19,16 @@ use deno_core::serde::Deserialize;
 use deno_core::serde::Serialize;
 use deno_core::serde_json;
 use deno_core::serde_json::json;
-use deno_core::ModuleSpecifier;
+use deno_core::url::Url;
 use deno_error::JsErrorBox;
 use deno_lint::diagnostic::LintDiagnosticRange;
 use deno_npm::NpmPackageId;
 use deno_path_util::url_to_file_path;
 use deno_resolver::npm::managed::NpmResolutionCell;
 use deno_runtime::deno_node::PathClean;
+use deno_semver::SmallStackString;
+use deno_semver::StackString;
+use deno_semver::Version;
 use deno_semver::jsr::JsrPackageNvReference;
 use deno_semver::jsr::JsrPackageReqReference;
 use deno_semver::npm::NpmPackageReqReference;
@@ -31,9 +36,6 @@ use deno_semver::package::PackageNv;
 use deno_semver::package::PackageNvReference;
 use deno_semver::package::PackageReq;
 use deno_semver::package::PackageReqReference;
-use deno_semver::SmallStackString;
-use deno_semver::StackString;
-use deno_semver::Version;
 use import_map::ImportMap;
 use lsp_types::Uri;
 use node_resolver::InNpmPackageChecker;
@@ -54,6 +56,7 @@ use super::language_server;
 use super::resolver::LspResolver;
 use super::tsc;
 use crate::args::jsr_url;
+use crate::lsp::urls::uri_to_url;
 use crate::tools::lint::CliLinter;
 use crate::util::path::relative_specifier;
 
@@ -233,6 +236,38 @@ fn code_as_string(code: &Option<lsp::NumberOrString>) -> String {
   }
 }
 
+/// Given a specifier and a referring specifier, determine if a value in the
+/// import map could be used as an import specifier that resolves using the
+/// import map.
+///
+/// This was inlined from the import_map crate in order to ignore more
+/// entries.
+pub fn import_map_lookup(
+  import_map: &ImportMap,
+  specifier: &Url,
+  referrer: &Url,
+) -> Option<String> {
+  let specifier_str = specifier.as_str();
+  for entry in import_map.entries_for_referrer(referrer) {
+    if let Some(address) = entry.value {
+      let address_str = address.as_str();
+      if referrer.as_str().starts_with(address_str) {
+        // ignore when the referrer has a common base with the
+        // import map entry (ex. `./src/a.ts` importing `./src/b.ts`
+        // and there's a `"$src/": "./src/"` import map entry)
+        continue;
+      }
+      if address_str == specifier_str {
+        return Some(entry.raw_key.to_string());
+      }
+      if address_str.ends_with('/') && specifier_str.starts_with(address_str) {
+        return Some(specifier_str.replace(address_str, entry.raw_key));
+      }
+    }
+  }
+  None
+}
+
 /// Rewrites imports in quick fixes and code changes to be Deno specific.
 pub struct TsResponseImportMapper<'a> {
   document_modules: &'a DocumentModules,
@@ -246,10 +281,13 @@ impl<'a> TsResponseImportMapper<'a> {
   pub fn new(
     document_modules: &'a DocumentModules,
     scope: Option<Arc<ModuleSpecifier>>,
-    maybe_import_map: Option<&'a ImportMap>,
     resolver: &'a LspResolver,
     tsc_specifier_map: &'a tsc::TscSpecifierMap,
   ) -> Self {
+    let maybe_import_map = resolver
+      .get_scoped_resolver(scope.as_deref())
+      .as_workspace_resolver()
+      .maybe_import_map();
     Self {
       document_modules,
       scope,
@@ -282,6 +320,12 @@ impl<'a> TsResponseImportMapper<'a> {
 
     let scoped_resolver =
       self.resolver.get_scoped_resolver(self.scope.as_deref());
+
+    if let Some(dep_name) =
+      scoped_resolver.resource_url_to_configured_dep_key(specifier, referrer)
+    {
+      return Some(dep_name);
+    }
 
     if let Some(jsr_path) = specifier.as_str().strip_prefix(jsr_url().as_str())
     {
@@ -335,17 +379,20 @@ impl<'a> TsResponseImportMapper<'a> {
       };
       let specifier = ModuleSpecifier::parse(&spec_str).ok()?;
       if let Some(import_map) = self.maybe_import_map {
-        if let Some(result) = import_map.lookup(&specifier, referrer) {
+        if let Some(result) =
+          import_map_lookup(import_map, &specifier, referrer)
+        {
           return Some(result);
         }
-        if let Some(req_ref_str) = specifier.as_str().strip_prefix("jsr:") {
-          if !req_ref_str.starts_with('/') {
-            let specifier_str = format!("jsr:/{req_ref_str}");
-            if let Ok(specifier) = ModuleSpecifier::parse(&specifier_str) {
-              if let Some(result) = import_map.lookup(&specifier, referrer) {
-                return Some(result);
-              }
-            }
+        if let Some(req_ref_str) = specifier.as_str().strip_prefix("jsr:")
+          && !req_ref_str.starts_with('/')
+        {
+          let specifier_str = format!("jsr:/{req_ref_str}");
+          if let Ok(specifier) = ModuleSpecifier::parse(&specifier_str)
+            && let Some(result) =
+              import_map_lookup(import_map, &specifier, referrer)
+          {
+            return Some(result);
           }
         }
       }
@@ -354,83 +401,86 @@ impl<'a> TsResponseImportMapper<'a> {
 
     if let Some(npm_resolver) = scoped_resolver.as_maybe_managed_npm_resolver()
     {
-      let in_npm_pkg = scoped_resolver
-        .as_in_npm_pkg_checker()
-        .in_npm_package(specifier);
-      if in_npm_pkg {
-        if let Ok(Some(pkg_id)) =
-          npm_resolver.resolve_pkg_id_from_specifier(specifier)
-        {
-          let pkg_reqs =
-            maybe_reverse_definitely_typed(&pkg_id, npm_resolver.resolution())
-              .unwrap_or_else(|| {
-                npm_resolver
-                  .resolution()
-                  .resolve_pkg_reqs_from_pkg_id(&pkg_id)
-              });
-          // check if any pkg reqs match what is found in an import map
-          if !pkg_reqs.is_empty() {
-            let sub_path = npm_resolver
-              .resolve_pkg_folder_from_pkg_id(&pkg_id)
-              .ok()
-              .and_then(|pkg_folder| {
-                self.resolve_package_path(specifier, &pkg_folder)
-              });
-            if let Some(import_map) = self.maybe_import_map {
-              let pkg_reqs = pkg_reqs.iter().collect::<HashSet<_>>();
-              let mut matches = Vec::new();
-              for entry in import_map.entries_for_referrer(referrer) {
-                if let Some(value) = entry.raw_value {
-                  if let Ok(package_ref) =
-                    NpmPackageReqReference::from_str(value)
-                  {
-                    if pkg_reqs.contains(package_ref.req()) {
-                      let sub_path = sub_path.as_deref().unwrap_or("");
-                      let value_sub_path = package_ref.sub_path().unwrap_or("");
-                      if let Some(key_sub_path) =
-                        sub_path.strip_prefix(value_sub_path)
-                      {
-                        // keys that don't end in a slash can't be mapped to a subpath
-                        if entry.raw_key.ends_with('/')
-                          || key_sub_path.is_empty()
-                        {
-                          matches
-                            .push(format!("{}{}", entry.raw_key, key_sub_path));
-                        }
-                      }
-                    }
-                  }
+      let match_specifier = || {
+        let in_npm_pkg = scoped_resolver
+          .as_in_npm_pkg_checker()
+          .in_npm_package(specifier);
+        if !in_npm_pkg {
+          return None;
+        }
+        let pkg_id = npm_resolver
+          .resolve_pkg_id_from_specifier(specifier)
+          .ok()??;
+        let pkg_reqs =
+          maybe_reverse_definitely_typed(&pkg_id, npm_resolver.resolution())
+            .unwrap_or_else(|| {
+              npm_resolver
+                .resolution()
+                .resolve_pkg_reqs_from_pkg_id(&pkg_id)
+            });
+        if pkg_reqs.is_empty() {
+          return None;
+        }
+        // check if any pkg reqs match what is found in an import map
+        let sub_path = npm_resolver
+          .resolve_pkg_folder_from_pkg_id(&pkg_id)
+          .ok()
+          .and_then(|pkg_folder| {
+            self.resolve_package_path(specifier, &pkg_folder)
+          })?;
+        let sub_path = Some(sub_path).filter(|s| !s.is_empty());
+        if let Some(import_map) = self.maybe_import_map {
+          let pkg_reqs = pkg_reqs.iter().collect::<HashSet<_>>();
+          let mut matches = Vec::new();
+          for entry in import_map.entries_for_referrer(referrer) {
+            if let Some(value) = entry.raw_value
+              && let Ok(package_ref) = NpmPackageReqReference::from_str(value)
+              && pkg_reqs.contains(package_ref.req())
+            {
+              let sub_path = sub_path.as_deref().unwrap_or("");
+              let value_sub_path = package_ref.sub_path().unwrap_or("");
+              if let Some(key_sub_path) = sub_path.strip_prefix(value_sub_path)
+              {
+                // keys that don't end in a slash can't be mapped to a subpath
+                if entry.raw_key.ends_with('/') || key_sub_path.is_empty() {
+                  matches.push(format!("{}{}", entry.raw_key, key_sub_path));
                 }
               }
-              // select the shortest match
-              matches.sort_by_key(|a| a.len());
-              if let Some(matched) = matches.first() {
-                return Some(matched.to_string());
-              }
-            }
-
-            // if not found in the import map, return the first pkg req
-            if let Some(pkg_req) = pkg_reqs.first() {
-              return Some(concat_npm_specifier(
-                "npm:",
-                pkg_req,
-                sub_path.as_deref(),
-              ));
             }
           }
+          // select the shortest match
+          matches.sort_by_key(|a| a.len());
+          if let Some(matched) = matches.first() {
+            return Some(matched.to_string());
+          }
         }
+
+        // if not found in the import map, return the first pkg req
+        if let Some(pkg_req) = pkg_reqs.first() {
+          return Some(concat_npm_specifier(
+            "npm:",
+            pkg_req,
+            sub_path.as_deref(),
+          ));
+        }
+        None
+      };
+      if let Some(result) = match_specifier() {
+        return Some(result);
       }
-    } else if let Some(dep_name) =
-      scoped_resolver.file_url_to_package_json_dep(specifier)
+    }
+
+    if let Some(bare_package_specifier) =
+      scoped_resolver.jsr_lookup_bare_specifier_for_workspace_file(specifier)
     {
-      return Some(dep_name);
+      return Some(bare_package_specifier);
     }
 
     // check if the import map has this specifier
-    if let Some(import_map) = self.maybe_import_map {
-      if let Some(result) = import_map.lookup(specifier, referrer) {
-        return Some(result);
-      }
+    if let Some(import_map) = self.maybe_import_map
+      && let Some(result) = import_map_lookup(import_map, specifier, referrer)
+    {
+      return Some(result);
     }
 
     None
@@ -449,8 +499,11 @@ impl<'a> TsResponseImportMapper<'a> {
       .get_closest_package_json(&package_root_folder.join("package.json"))
       .ok()
       .flatten()?;
-    let root_folder = package_json.path.parent()?;
+    let Some(exports) = &package_json.exports else {
+      return Some("".to_string());
+    };
 
+    let root_folder = package_json.path.parent()?;
     let specifier_path = url_to_file_path(specifier).ok()?;
     let mut search_paths = vec![specifier_path.clone()];
     // TypeScript will provide a .js extension for quick fixes, so do
@@ -476,14 +529,10 @@ impl<'a> TsResponseImportMapper<'a> {
     }
 
     for search_path in search_paths {
-      if let Some(exports) = &package_json.exports {
-        if let Some(result) = try_reverse_map_package_json_exports(
-          root_folder,
-          &search_path,
-          exports,
-        ) {
-          return Some(result);
-        }
+      if let Some(result) =
+        try_reverse_map_package_json_exports(root_folder, &search_path, exports)
+      {
+        return Some(result);
       }
     }
 
@@ -498,6 +547,7 @@ impl<'a> TsResponseImportMapper<'a> {
     specifier: &str,
     referrer: &ModuleSpecifier,
     resolution_mode: ResolutionMode,
+    new_file_hints: &[Url],
   ) -> Option<String> {
     let specifier_stem = specifier.strip_suffix(".js").unwrap_or(specifier);
     let specifiers = std::iter::once(Cow::Borrowed(specifier)).chain(
@@ -520,18 +570,17 @@ impl<'a> TsResponseImportMapper<'a> {
         .ok()
         .and_then(|s| self.tsc_specifier_map.normalize(s.as_str()).ok())
         .filter(|s| {
-          self
-            .document_modules
-            .specifier_exists(s, self.scope.as_deref())
+          new_file_hints.contains(s)
+            || self
+              .document_modules
+              .specifier_exists(s, self.scope.as_deref())
         })
-      {
-        if let Some(specifier) = self
+        && let Some(specifier) = self
           .check_specifier(&specifier, referrer)
           .or_else(|| relative_specifier(referrer, &specifier))
           .filter(|s| !s.contains("/node_modules/"))
-        {
-          return Some(specifier);
-        }
+      {
+        return Some(specifier);
       }
     }
     None
@@ -554,7 +603,16 @@ impl<'a> TsResponseImportMapper<'a> {
         resolution_mode,
         NodeResolutionKind::Types,
       )
-      .is_ok()
+      .ok()
+      .filter(|s| {
+        let specifier = self
+          .tsc_specifier_map
+          .normalize(s.as_str())
+          .map(Cow::Owned)
+          .unwrap_or(Cow::Borrowed(s));
+        !specifier.as_str().contains("/node_modules/")
+      })
+      .is_some()
   }
 }
 
@@ -575,11 +633,7 @@ fn maybe_reverse_definitely_typed(
     .filter_map(|(req, nv)| (*nv.name == package_name).then_some(req))
     .collect::<Vec<_>>();
 
-  if reqs.is_empty() {
-    None
-  } else {
-    Some(reqs)
-  }
+  if reqs.is_empty() { None } else { Some(reqs) }
 }
 
 fn try_reverse_map_package_json_exports(
@@ -628,16 +682,7 @@ fn try_reverse_map_package_json_exports(
     None
   }
 
-  let result = try_reverse_map_package_json_exports_inner(
-    root_path,
-    target_path,
-    exports,
-  )?;
-  if result.is_empty() {
-    None
-  } else {
-    Some(result)
-  }
+  try_reverse_map_package_json_exports_inner(root_path, target_path, exports)
 }
 
 /// For a set of tsc changes, can them for any that contain something that looks
@@ -649,6 +694,11 @@ pub fn fix_ts_import_changes(
   token: &CancellationToken,
 ) -> Result<Vec<tsc::FileTextChanges>, AnyError> {
   let mut r = Vec::new();
+  let new_file_hints = changes
+    .iter()
+    .filter(|c| c.is_new_file.unwrap_or(false))
+    .filter_map(|c| resolve_url(&c.file_name).ok())
+    .collect::<Vec<_>>();
   for change in changes {
     if token.is_cancelled() {
       return Err(anyhow!("request cancelled"));
@@ -660,11 +710,11 @@ pub fn fix_ts_import_changes(
     let target_module = if is_new_file {
       None
     } else {
-      let Some(target_module) = language_server
-        .document_modules
-        .inspect_module_for_specifier(
+      let Some(target_module) =
+        language_server.document_modules.module_for_specifier(
           &target_specifier,
           module.scope.as_deref(),
+          Some(&module.compiler_options_key),
         )
       else {
         continue;
@@ -690,6 +740,7 @@ pub fn fix_ts_import_changes(
                 specifier,
                 &target_specifier,
                 resolution_mode,
+                &new_file_hints,
               )
             {
               line.replace(specifier, &new_specifier)
@@ -712,6 +763,54 @@ pub fn fix_ts_import_changes(
       text_changes,
       is_new_file: change.is_new_file,
     });
+  }
+  Ok(r)
+}
+
+pub fn fix_ts_import_changes_for_file_rename(
+  changes: Vec<tsc::FileTextChanges>,
+  new_uri: &str,
+  old_module: &DocumentModule,
+  language_server: &language_server::Inner,
+  token: &CancellationToken,
+) -> Result<Vec<tsc::FileTextChanges>, AnyError> {
+  let Ok(new_uri) = Uri::from_str(new_uri) else {
+    return Ok(Vec::new());
+  };
+  if !new_uri.scheme().is_some_and(|s| s.eq_lowercase("file")) {
+    return Ok(Vec::new());
+  }
+  let new_file_hints = [uri_to_url(&new_uri)];
+  let mut r = Vec::with_capacity(changes.len());
+  for mut change in changes {
+    if token.is_cancelled() {
+      return Err(anyhow!("request cancelled"));
+    }
+    let Ok(target_specifier) = resolve_url(&change.file_name) else {
+      continue;
+    };
+    let Some(target_module) =
+      language_server.document_modules.module_for_specifier(
+        &target_specifier,
+        old_module.scope.as_deref(),
+        Some(&old_module.compiler_options_key),
+      )
+    else {
+      continue;
+    };
+    let import_mapper =
+      language_server.get_ts_response_import_mapper(&target_module);
+    for text_change in &mut change.text_changes {
+      if let Some(new_specifier) = import_mapper.check_unresolved_specifier(
+        &text_change.new_text,
+        &target_module.specifier,
+        target_module.resolution_mode,
+        &new_file_hints,
+      ) {
+        text_change.new_text = new_specifier;
+      }
+    }
+    r.push(change);
   }
   Ok(r)
 }
@@ -742,6 +841,12 @@ fn fix_ts_import_action<'a>(
     specifier,
     &module.specifier,
     module.resolution_mode,
+    &action
+      .changes
+      .iter()
+      .filter(|c| c.is_new_file.unwrap_or(false))
+      .filter_map(|c| resolve_url(&c.file_name).ok())
+      .collect::<Vec<_>>(),
   ) {
     let description = action.description.replace(specifier, &new_specifier);
     let changes = action
@@ -826,7 +931,7 @@ fn is_preferred(
     } else if let CodeActionKind::Deno(_) = i {
       // This is to make sure 'Remove import' isn't preferred over 'Cache
       // dependencies'.
-      return false;
+      false
     } else {
       true
     }
@@ -1149,19 +1254,18 @@ impl CodeActionCollection {
       .actions
       .push(CodeActionKind::Tsc(code_action, action.as_ref().clone()));
 
-    if let Some(fix_id) = &action.fix_id {
-      if let Some(CodeActionKind::Tsc(existing_fix_all, existing_action)) =
+    if let Some(fix_id) = &action.fix_id
+      && let Some(CodeActionKind::Tsc(existing_fix_all, existing_action)) =
         self.fix_all_actions.get(&FixAllKind::Tsc(fix_id.clone()))
-      {
-        self.actions.retain(|i| match i {
-          CodeActionKind::Tsc(c, _) => c != existing_fix_all,
-          _ => true,
-        });
-        self.actions.push(CodeActionKind::Tsc(
-          existing_fix_all.clone(),
-          existing_action.clone(),
-        ));
-      }
+    {
+      self.actions.retain(|i| match i {
+        CodeActionKind::Tsc(c, _) => c != existing_fix_all,
+        _ => true,
+      });
+      self.actions.push(CodeActionKind::Tsc(
+        existing_fix_all.clone(),
+        existing_action.clone(),
+      ));
     }
     Ok(())
   }
@@ -1257,12 +1361,15 @@ impl CodeActionCollection {
       // other diagnostics that could be bundled together in a "fix all" code
       // action
       file_diagnostics.iter().any(|d| {
-        if d == diagnostic || d.code.is_none() || diagnostic.code.is_none() {
-          false
-        } else {
-          d.code == diagnostic.code
-            || is_equivalent_code(&d.code, &diagnostic.code)
+        if d.source.as_deref() != Some(DiagnosticSource::Ts.as_lsp_source())
+          || d == diagnostic
+          || d.code.is_none()
+          || diagnostic.code.is_none()
+        {
+          return false;
         }
+        d.code == diagnostic.code
+          || is_equivalent_code(&d.code, &diagnostic.code)
       })
     }
   }
@@ -1339,8 +1446,6 @@ pub fn source_range_to_lsp_range(
 
 #[cfg(test)]
 mod tests {
-  use std::path::PathBuf;
-
   use super::*;
 
   #[test]
@@ -1423,8 +1528,8 @@ mod tests {
     let exports = exports.as_object().unwrap();
     assert_eq!(
       try_reverse_map_package_json_exports(
-        &PathBuf::from("/project/"),
-        &PathBuf::from("/project/hooks/index.d.ts"),
+        Path::new("/project/"),
+        Path::new("/project/hooks/index.d.ts"),
         exports,
       )
       .unwrap(),
@@ -1432,23 +1537,26 @@ mod tests {
     );
     assert_eq!(
       try_reverse_map_package_json_exports(
-        &PathBuf::from("/project/"),
-        &PathBuf::from("/project/dist/devtools.module.js"),
+        Path::new("/project/"),
+        Path::new("/project/dist/devtools.module.js"),
         exports,
       )
       .unwrap(),
       "hooks"
     );
-    assert!(try_reverse_map_package_json_exports(
-      &PathBuf::from("/project/"),
-      &PathBuf::from("/project/src/index.d.ts"),
-      exports,
-    )
-    .is_none());
     assert_eq!(
       try_reverse_map_package_json_exports(
-        &PathBuf::from("/project/"),
-        &PathBuf::from("/project/utils_sub_utils.d.ts"),
+        Path::new("/project/"),
+        Path::new("/project/src/index.d.ts"),
+        exports,
+      )
+      .unwrap(),
+      ""
+    );
+    assert_eq!(
+      try_reverse_map_package_json_exports(
+        Path::new("/project/"),
+        Path::new("/project/utils_sub_utils.d.ts"),
         exports,
       )
       .unwrap(),

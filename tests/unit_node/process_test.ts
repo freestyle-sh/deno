@@ -21,6 +21,7 @@ import {
   assert,
   assertEquals,
   assertFalse,
+  assertMatch,
   assertObjectMatch,
   assertStrictEquals,
   assertThrows,
@@ -29,6 +30,7 @@ import {
 import { stripAnsiCode } from "@std/fmt/colors";
 import * as path from "@std/path";
 import { delay } from "@std/async/delay";
+import { stub } from "@std/testing/mock";
 
 const testDir = new URL(".", import.meta.url);
 
@@ -248,9 +250,7 @@ Deno.test(
 
     // kill with signal 0 should keep the process alive in linux (true means no error happened)
     // windows ignore signals
-    if (Deno.build.os !== "windows") {
-      assertEquals(process.kill(p.pid, 0), true);
-    }
+    assertEquals(process.kill(p.pid, 0), true);
     process.kill(p.pid);
     await p.status;
   },
@@ -433,15 +433,30 @@ Deno.test({
   },
 });
 
+// #30701
+Deno.test({
+  name: "process.env handles falsy values correctly",
+  fn() {
+    const key = "TEST_ENV_VAR_EMPTY_STRING";
+    Deno.env.set(key, "");
+
+    assertEquals(process.env[key], "");
+    assertEquals(Object.keys(process.env).includes(key), true);
+    assert(key in process.env);
+    assert(Object.hasOwn(process.env, key));
+  },
+});
+
 Deno.test({
   name: "process.env requires scoped env permission",
   permissions: { env: ["FOO"] },
   fn() {
     Deno.env.set("FOO", "1");
     assert("FOO" in process.env);
-    assertFalse("BAR" in process.env);
+    assertThrows(() => {
+      process.env.BAR;
+    }, Deno.errors.NotCapable);
     assert(Object.hasOwn(process.env, "FOO"));
-    assertFalse(Object.hasOwn(process.env, "BAR"));
   },
 });
 
@@ -656,6 +671,7 @@ Deno.test({
     const consoleSize = isTTY ? Deno.consoleSize() : undefined;
     assertEquals(process.stdout.columns, consoleSize?.columns);
     assertEquals(process.stdout.rows, consoleSize?.rows);
+    assert([1, 4, 8, 24].includes(process.stdout.getColorDepth()));
     assertEquals(
       `${process.stdout.getWindowSize()}`,
       `${consoleSize && [consoleSize.columns, consoleSize.rows]}`,
@@ -943,6 +959,28 @@ Deno.test({
 });
 
 Deno.test({
+  name: "process._rawDebug",
+  async fn() {
+    const command = new Deno.Command(Deno.execPath(), {
+      args: [
+        "run",
+        "--quiet",
+        "./testdata/process_raw_debug.ts",
+      ],
+      cwd: testDir,
+    });
+    const { stdout, stderr } = await command.output();
+
+    assertEquals(stdout.length, 0);
+    const decoder = new TextDecoder();
+    assertEquals(
+      stripAnsiCode(decoder.decode(stderr).trim()),
+      "this should go to stderr { a: 1, b: [ 'a', 2 ] }",
+    );
+  },
+});
+
+Deno.test({
   name: "process.stdout isn't closed when source stream ended",
   async fn() {
     const source = Readable.from(["foo", "bar"]);
@@ -1213,4 +1251,42 @@ Deno.test("getBuiltinModule", () => {
   assert(process.getBuiltinModule("fs"));
   assert(process.getBuiltinModule("node:fs"));
   assertEquals(process.getBuiltinModule("something"), undefined);
+});
+
+Deno.test("process.emitWarning() prints to stderr", async () => {
+  using writeStub = stub(process.stderr, "write", () => true);
+  const { promise, resolve } = Promise.withResolvers<void>();
+  process.on("warning", () => resolve());
+
+  process.emitWarning("This is a warning", {
+    code: "TEST0001",
+    detail: "This is some additional information",
+  });
+
+  await promise;
+
+  const arg = writeStub.calls[0].args[0];
+  assert(typeof arg === "string");
+  assertMatch(
+    arg,
+    /\(node:\d+\) \[TEST0001\] Warning: This is a warning\nThis is some additional information\n/,
+  );
+});
+
+Deno.test("process.emitWarning() does not print to stderr when it is deprecation warning and noDeprecation is set to true", async () => {
+  using writeStub = stub(process.stderr, "write", () => true);
+
+  // deno-lint-ignore no-explicit-any
+  (process as any).noDeprecation = true; // Set noDeprecation to true
+  process.emitWarning("This is a deprecation warning", {
+    code: "TEST0002",
+    detail: "This is some additional information",
+    type: "DeprecationWarning",
+  });
+
+  await delay(10);
+
+  assertEquals(writeStub.calls.length, 0);
+  // deno-lint-ignore no-explicit-any
+  (process as any).noDeprecation = false; // Reset noDeprecation
 });

@@ -8,25 +8,26 @@ use std::panic::AssertUnwindSafe;
 use std::rc::Rc;
 
 use anyhow::Context;
-use file_test_runner::collection::collect_tests_or_exit;
-use file_test_runner::collection::strategies::FileTestMapperStrategy;
-use file_test_runner::collection::strategies::TestPerDirectoryCollectionStrategy;
+use file_test_runner::TestResult;
 use file_test_runner::collection::CollectOptions;
 use file_test_runner::collection::CollectTestsError;
 use file_test_runner::collection::CollectedCategoryOrTest;
 use file_test_runner::collection::CollectedTest;
 use file_test_runner::collection::CollectedTestCategory;
-use file_test_runner::TestResult;
+use file_test_runner::collection::collect_tests_or_exit;
+use file_test_runner::collection::strategies::FileTestMapperStrategy;
+use file_test_runner::collection::strategies::TestPerDirectoryCollectionStrategy;
 use once_cell::sync::Lazy;
 use serde::Deserialize;
-use test_util::tests_path;
 use test_util::PathRef;
 use test_util::TestContextBuilder;
+use test_util::tests_path;
 
 const MANIFEST_FILE_NAME: &str = "__test__.jsonc";
 
-static NO_CAPTURE: Lazy<bool> =
-  Lazy::new(|| std::env::args().any(|arg| arg == "--nocapture"));
+static NO_CAPTURE: Lazy<bool> = Lazy::new(|| {
+  std::env::args().any(|arg| arg == "--no-capture" || arg == "--nocapture")
+});
 
 #[derive(Clone, Deserialize)]
 #[serde(untagged)]
@@ -67,10 +68,10 @@ impl MultiTestMetaData {
       multi_test_meta_data: &MultiTestMetaData,
       value: &mut JsonMap,
     ) {
-      if let Some(base) = &multi_test_meta_data.base {
-        if !value.contains_key("base") {
-          value.insert("base".to_string(), base.clone().into());
-        }
+      if let Some(base) = &multi_test_meta_data.base
+        && !value.contains_key("base")
+      {
+        value.insert("base".to_string(), base.clone().into());
       }
       if multi_test_meta_data.temp_dir && !value.contains_key("tempDir") {
         value.insert("tempDir".to_string(), true.into());
@@ -117,6 +118,9 @@ struct MultiStepMetaData {
   /// steps.
   #[serde(default)]
   pub temp_dir: bool,
+  /// Whether to run this test.
+  #[serde(rename = "if")]
+  pub if_cond: Option<String>,
   /// Whether the temporary directory should be canonicalized.
   ///
   /// This should be used sparingly, but is sometimes necessary
@@ -126,6 +130,8 @@ struct MultiStepMetaData {
   /// Whether the temporary directory should be symlinked to another path.
   #[serde(default)]
   pub symlinked_temp_dir: bool,
+  #[serde(default)]
+  pub flaky: bool,
   /// The base environment to use for the test.
   #[serde(default)]
   pub base: Option<String>,
@@ -165,6 +171,8 @@ impl SingleTestMetaData {
     MultiStepMetaData {
       base: self.base,
       cwd: None,
+      if_cond: self.step.if_cond.clone(),
+      flaky: self.step.flaky,
       temp_dir: self.temp_dir,
       canonicalized_temp_dir: self.canonicalized_temp_dir,
       symlinked_temp_dir: self.symlinked_temp_dir,
@@ -260,7 +268,7 @@ fn run_test(test: &CollectedTest<serde_json::Value>) -> TestResult {
   let diagnostic_logger = Rc::new(RefCell::new(Vec::<u8>::new()));
   let result = TestResult::from_maybe_panic_or_result(AssertUnwindSafe(|| {
     let metadata = deserialize_value(metadata_value);
-    if metadata.ignore {
+    if metadata.ignore || !should_run(metadata.if_cond.as_deref()) {
       TestResult::Ignored
     } else if let Some(repeat) = metadata.repeat {
       for _ in 0..repeat {
@@ -292,14 +300,26 @@ fn run_test_inner(
   cwd: &PathRef,
   diagnostic_logger: Rc<RefCell<Vec<u8>>>,
 ) {
-  let context = test_context_from_metadata(metadata, cwd, diagnostic_logger);
-  for step in metadata.steps.iter().filter(|s| should_run_step(s)) {
-    let run_func = || run_step(step, metadata, cwd, &context);
-    if step.flaky {
-      run_flaky(run_func);
-    } else {
-      run_func();
+  let run_fn = || {
+    let context =
+      test_context_from_metadata(metadata, cwd, diagnostic_logger.clone());
+    for step in metadata
+      .steps
+      .iter()
+      .filter(|s| should_run(s.if_cond.as_deref()))
+    {
+      let run_func = || run_step(step, metadata, cwd, &context);
+      if step.flaky {
+        run_flaky(run_func);
+      } else {
+        run_func();
+      }
     }
+  };
+  if metadata.flaky {
+    run_flaky(run_fn);
+  } else {
+    run_fn();
   }
 }
 
@@ -379,9 +399,9 @@ fn test_context_from_metadata(
   context
 }
 
-fn should_run_step(step: &StepMetaData) -> bool {
-  if let Some(cond) = &step.if_cond {
-    match cond.as_str() {
+fn should_run(if_cond: Option<&str>) -> bool {
+  if let Some(cond) = if_cond {
+    match cond {
       "windows" => cfg!(windows),
       "unix" => cfg!(unix),
       "mac" => cfg!(target_os = "macos"),
@@ -434,7 +454,14 @@ fn run_step(
     false => command,
   };
   let command = match &step.input {
-    Some(input) => command.stdin_text(input),
+    Some(input) => {
+      if input.ends_with(".in") {
+        let test_input_path = cwd.join(input);
+        command.stdin_text(std::fs::read_to_string(test_input_path).unwrap())
+      } else {
+        command.stdin_text(input)
+      }
+    }
     None => command,
   };
   let output = command.run();
@@ -442,6 +469,10 @@ fn run_step(
     let test_output_path = cwd.join(&step.output);
     output.assert_matches_file(test_output_path);
   } else {
+    assert!(
+      step.output.len() <= 160,
+      "The \"output\" property in your __test__.jsonc file is too long. Please extract this to an `.out` file to improve readability."
+    );
     output.assert_matches_text(&step.output);
   }
   output.assert_exit_code(step.exit_code);

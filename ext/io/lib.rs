@@ -10,30 +10,38 @@ use std::io::Read;
 use std::io::Seek;
 use std::io::Write;
 #[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(unix)]
 use std::os::unix::io::FromRawFd;
 #[cfg(windows)]
 use std::os::windows::io::FromRawHandle;
+#[cfg(unix)]
+use std::process::Stdio as StdStdio;
 use std::rc::Rc;
 #[cfg(windows)]
 use std::sync::Arc;
 
-use deno_core::futures::TryFutureExt;
-use deno_core::op2;
-use deno_core::unsync::spawn_blocking;
-use deno_core::unsync::TaskQueue;
 use deno_core::AsyncMutFuture;
 use deno_core::AsyncRefCell;
 use deno_core::AsyncResult;
 use deno_core::BufMutView;
 use deno_core::BufView;
+use deno_core::CancelFuture;
 use deno_core::CancelHandle;
 use deno_core::CancelTryFuture;
+use deno_core::JsBuffer;
 use deno_core::OpState;
 use deno_core::RcRef;
 use deno_core::Resource;
 use deno_core::ResourceHandle;
 use deno_core::ResourceHandleFd;
+use deno_core::futures::TryFutureExt;
+use deno_core::op2;
+use deno_core::unsync::TaskQueue;
+use deno_core::unsync::spawn_blocking;
 use deno_error::JsErrorBox;
+#[cfg(windows)]
+use deno_subprocess_windows::Stdio as StdStdio;
 use fs::FileResource;
 use fs::FsError;
 use fs::FsResult;
@@ -61,18 +69,18 @@ mod winpipe;
 
 mod bi_pipe;
 
-pub use bi_pipe::bi_pipe_pair_raw;
 pub use bi_pipe::BiPipe;
 pub use bi_pipe::BiPipeRead;
 pub use bi_pipe::BiPipeResource;
 pub use bi_pipe::BiPipeWrite;
 pub use bi_pipe::RawBiPipeHandle;
-pub use pipe::pipe;
+pub use bi_pipe::bi_pipe_pair_raw;
 pub use pipe::AsyncPipeRead;
 pub use pipe::AsyncPipeWrite;
 pub use pipe::PipeRead;
 pub use pipe::PipeWrite;
 pub use pipe::RawPipeHandle;
+pub use pipe::pipe;
 
 /// Abstraction over `AsRawFd` (unix) and `AsRawHandle` (windows)
 pub trait AsRawIoHandle {
@@ -217,6 +225,10 @@ pub static STDERR_HANDLE: Lazy<StdFile> = Lazy::new(|| {
 
 deno_core::extension!(deno_io,
   deps = [ deno_web ],
+  ops = [
+    op_read_with_cancel_handle,
+    op_read_create_cancel_handle,
+  ],
   esm = [ "12_io.js" ],
   options = {
     stdio: Option<Stdio>,
@@ -408,7 +420,7 @@ where
 pub type ChildStdinResource = WriteOnlyResource<process::ChildStdin>;
 
 impl Resource for ChildStdinResource {
-  fn name(&self) -> Cow<str> {
+  fn name(&self) -> Cow<'_, str> {
     "childStdin".into()
   }
 
@@ -424,7 +436,7 @@ pub type ChildStdoutResource = ReadOnlyResource<process::ChildStdout>;
 impl Resource for ChildStdoutResource {
   deno_core::impl_readable_byob!();
 
-  fn name(&self) -> Cow<str> {
+  fn name(&self) -> Cow<'_, str> {
     "childStdout".into()
   }
 
@@ -438,7 +450,7 @@ pub type ChildStderrResource = ReadOnlyResource<process::ChildStderr>;
 impl Resource for ChildStderrResource {
   deno_core::impl_readable_byob!();
 
-  fn name(&self) -> Cow<str> {
+  fn name(&self) -> Cow<'_, str> {
     "childStderr".into()
   }
 
@@ -554,7 +566,7 @@ impl StdFileResourceInner {
   fn with_blocking_task<F, R: 'static + Send>(
     &self,
     action: F,
-  ) -> impl Future<Output = R>
+  ) -> impl Future<Output = R> + use<F, R>
   where
     F: FnOnce() -> R + Send + 'static,
   {
@@ -816,24 +828,99 @@ impl crate::fs::File for StdFileResourceInner {
     }
   }
 
-  fn chmod_sync(self: Rc<Self>, _mode: u32) -> FsResult<()> {
+  fn chmod_sync(self: Rc<Self>, mode: u32) -> FsResult<()> {
     #[cfg(unix)]
     {
       use std::os::unix::prelude::PermissionsExt;
       self.with_sync(|file| {
-        Ok(file.set_permissions(std::fs::Permissions::from_mode(_mode))?)
+        Ok(file.set_permissions(std::fs::Permissions::from_mode(mode))?)
       })
     }
-    #[cfg(not(unix))]
-    Err(FsError::NotSupported)
+    #[cfg(windows)]
+    {
+      self.with_sync(|file| {
+        let mut permissions = file.metadata()?.permissions();
+        if mode & libc::S_IWRITE as u32 > 0 {
+          // clippy warning should only be applicable to Unix platforms
+          // https://rust-lang.github.io/rust-clippy/master/index.html#permissions_set_readonly_false
+          #[allow(clippy::permissions_set_readonly_false)]
+          permissions.set_readonly(false);
+        } else {
+          permissions.set_readonly(true);
+        }
+        file.set_permissions(permissions)?;
+        Ok(())
+      })
+    }
   }
-  async fn chmod_async(self: Rc<Self>, _mode: u32) -> FsResult<()> {
+  async fn chmod_async(self: Rc<Self>, mode: u32) -> FsResult<()> {
     #[cfg(unix)]
     {
       use std::os::unix::prelude::PermissionsExt;
       self
         .with_inner_blocking_task(move |file| {
-          Ok(file.set_permissions(std::fs::Permissions::from_mode(_mode))?)
+          Ok(file.set_permissions(std::fs::Permissions::from_mode(mode))?)
+        })
+        .await
+    }
+    #[cfg(windows)]
+    {
+      self
+        .with_inner_blocking_task(move |file| {
+          let mut permissions = file.metadata()?.permissions();
+          if mode & libc::S_IWRITE as u32 > 0 {
+            // clippy warning should only be applicable to Unix platforms
+            // https://rust-lang.github.io/rust-clippy/master/index.html#permissions_set_readonly_false
+            #[allow(clippy::permissions_set_readonly_false)]
+            permissions.set_readonly(false);
+          } else {
+            permissions.set_readonly(true);
+          }
+          file.set_permissions(permissions)?;
+          Ok(())
+        })
+        .await
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+      Err(FsError::NotSupported)
+    }
+  }
+
+  fn chown_sync(
+    self: Rc<Self>,
+    _uid: Option<u32>,
+    _gid: Option<u32>,
+  ) -> FsResult<()> {
+    #[cfg(unix)]
+    {
+      let owner = _uid.map(nix::unistd::Uid::from_raw);
+      let group = _gid.map(nix::unistd::Gid::from_raw);
+      let res = nix::unistd::fchown(self.handle, owner, group);
+      if let Err(err) = res {
+        Err(io::Error::from_raw_os_error(err as i32).into())
+      } else {
+        Ok(())
+      }
+    }
+    #[cfg(not(unix))]
+    Err(FsError::NotSupported)
+  }
+
+  async fn chown_async(
+    self: Rc<Self>,
+    _uid: Option<u32>,
+    _gid: Option<u32>,
+  ) -> FsResult<()> {
+    #[cfg(unix)]
+    {
+      self
+        .with_inner_blocking_task(move |file| {
+          use std::os::fd::AsFd;
+          let owner = _uid.map(nix::unistd::Uid::from_raw);
+          let group = _gid.map(nix::unistd::Gid::from_raw);
+          nix::unistd::fchown(file.as_fd().as_raw_fd(), owner, group)
+            .map_err(|err| io::Error::from_raw_os_error(err as i32).into())
         })
         .await
     }
@@ -869,14 +956,46 @@ impl crate::fs::File for StdFileResourceInner {
   }
 
   fn stat_sync(self: Rc<Self>) -> FsResult<FsStat> {
-    self.with_sync(|file| Ok(file.metadata().map(FsStat::from_std)?))
+    #[cfg(unix)]
+    {
+      self.with_sync(|file| Ok(file.metadata().map(FsStat::from_std)?))
+    }
+    #[cfg(windows)]
+    {
+      self.with_sync(|file| {
+        let mut fs_stat = file.metadata().map(FsStat::from_std)?;
+        stat_extra(file, &mut fs_stat)?;
+        Ok(fs_stat)
+      })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+      Err(FsError::NotSupported)
+    }
   }
   async fn stat_async(self: Rc<Self>) -> FsResult<FsStat> {
-    self
-      .with_inner_blocking_task(|file| {
-        Ok(file.metadata().map(FsStat::from_std)?)
-      })
-      .await
+    #[cfg(unix)]
+    {
+      self
+        .with_inner_blocking_task(|file| {
+          Ok(file.metadata().map(FsStat::from_std)?)
+        })
+        .await
+    }
+    #[cfg(windows)]
+    {
+      self
+        .with_inner_blocking_task(|file| {
+          let mut fs_stat = file.metadata().map(FsStat::from_std)?;
+          stat_extra(file, &mut fs_stat)?;
+          Ok(fs_stat)
+        })
+        .await
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+      Err(FsError::NotSupported)
+    }
   }
 
   fn lock_sync(self: Rc<Self>, exclusive: bool) -> FsResult<()> {
@@ -987,19 +1106,72 @@ impl crate::fs::File for StdFileResourceInner {
     }
   }
 
-  fn as_stdio(self: Rc<Self>) -> FsResult<std::process::Stdio> {
+  fn as_stdio(self: Rc<Self>) -> FsResult<StdStdio> {
     match self.kind {
       StdFileResourceKind::File => self.with_sync(|file| {
         let file = file.try_clone()?;
         Ok(file.into())
       }),
-      _ => Ok(std::process::Stdio::inherit()),
+      _ => Ok(StdStdio::inherit()),
     }
   }
 
   fn backing_fd(self: Rc<Self>) -> Option<ResourceHandleFd> {
     Some(self.handle)
   }
+}
+
+pub struct ReadCancelResource(Rc<CancelHandle>);
+
+impl Resource for ReadCancelResource {
+  fn name(&self) -> Cow<'_, str> {
+    "readCancel".into()
+  }
+
+  fn close(self: Rc<Self>) {
+    self.0.cancel();
+  }
+}
+
+#[op2(fast)]
+#[smi]
+pub fn op_read_create_cancel_handle(state: &mut OpState) -> u32 {
+  state
+    .resource_table
+    .add(ReadCancelResource(CancelHandle::new_rc()))
+}
+
+#[op2(async)]
+pub async fn op_read_with_cancel_handle(
+  state: Rc<RefCell<OpState>>,
+  #[smi] rid: u32,
+  #[smi] cancel_handle: u32,
+  #[buffer] buf: JsBuffer,
+) -> Result<u32, JsErrorBox> {
+  let (fut, cancel_rc) = {
+    let state = state.borrow();
+    let cancel_handle = state
+      .resource_table
+      .get::<ReadCancelResource>(cancel_handle)
+      .unwrap()
+      .0
+      .clone();
+
+    (
+      FileResource::with_file(&state, rid, |file| {
+        let view = BufMutView::from(buf);
+        Ok(file.read_byob(view))
+      }),
+      cancel_handle,
+    )
+  };
+
+  fut?
+    .or_cancel(cancel_rc)
+    .await
+    .map_err(|_| JsErrorBox::generic("cancelled"))?
+    .map(|(n, _)| n as u32)
+    .map_err(JsErrorBox::from_err)
 }
 
 // override op_print to use the stdout and stderr in the resource table
@@ -1015,4 +1187,126 @@ pub fn op_print(
       .write_all_sync(msg.as_bytes())
       .map_err(JsErrorBox::from_err)
   })
+}
+
+#[cfg(windows)]
+pub fn stat_extra(file: &std::fs::File, fsstat: &mut FsStat) -> FsResult<()> {
+  use std::os::windows::io::AsRawHandle;
+
+  unsafe fn get_dev(
+    handle: winapi::shared::ntdef::HANDLE,
+  ) -> std::io::Result<u64> {
+    use winapi::shared::minwindef::FALSE;
+    use winapi::um::fileapi::BY_HANDLE_FILE_INFORMATION;
+    use winapi::um::fileapi::GetFileInformationByHandle;
+
+    // SAFETY: winapi calls
+    unsafe {
+      let info = {
+        let mut info =
+          std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+        if GetFileInformationByHandle(handle, info.as_mut_ptr()) == FALSE {
+          return Err(std::io::Error::last_os_error());
+        }
+
+        info.assume_init()
+      };
+
+      Ok(info.dwVolumeSerialNumber as u64)
+    }
+  }
+
+  const WINDOWS_TICK: i64 = 10_000; // 100-nanosecond intervals in a millisecond
+  const SEC_TO_UNIX_EPOCH: i64 = 11_644_473_600; // Seconds between Windows epoch and Unix epoch
+
+  fn windows_time_to_unix_time_msec(windows_time: &i64) -> i64 {
+    let milliseconds_since_windows_epoch = windows_time / WINDOWS_TICK;
+    milliseconds_since_windows_epoch - SEC_TO_UNIX_EPOCH * 1000
+  }
+
+  use windows_sys::Wdk::Storage::FileSystem::FILE_ALL_INFORMATION;
+  use windows_sys::Win32::Foundation::NTSTATUS;
+
+  unsafe fn query_file_information(
+    handle: winapi::shared::ntdef::HANDLE,
+  ) -> Result<FILE_ALL_INFORMATION, NTSTATUS> {
+    use windows_sys::Wdk::Storage::FileSystem::NtQueryInformationFile;
+    use windows_sys::Win32::Foundation::ERROR_MORE_DATA;
+    use windows_sys::Win32::Foundation::RtlNtStatusToDosError;
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+
+    // SAFETY: winapi calls
+    unsafe {
+      let mut info = std::mem::MaybeUninit::<FILE_ALL_INFORMATION>::zeroed();
+      let mut io_status_block =
+        std::mem::MaybeUninit::<IO_STATUS_BLOCK>::zeroed();
+      let status = NtQueryInformationFile(
+        handle as _,
+        io_status_block.as_mut_ptr(),
+        info.as_mut_ptr() as *mut _,
+        std::mem::size_of::<FILE_ALL_INFORMATION>() as _,
+        18, /* FileAllInformation */
+      );
+
+      if status < 0 {
+        let converted_status = RtlNtStatusToDosError(status);
+
+        // If error more data is returned, then it means that the buffer is too small to get full filename information
+        // to have that we should retry. However, since we only use BasicInformation and StandardInformation, it is fine to ignore it
+        // since struct is populated with other data anyway.
+        // https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-ntqueryinformationfile#remarksdd
+        if converted_status != ERROR_MORE_DATA {
+          return Err(converted_status as NTSTATUS);
+        }
+      }
+
+      Ok(info.assume_init())
+    }
+  }
+
+  // SAFETY: winapi calls
+  unsafe {
+    let file_handle = file.as_raw_handle();
+
+    fsstat.dev = get_dev(file_handle)?;
+
+    if let Ok(file_info) = query_file_information(file_handle) {
+      fsstat.ctime = Some(windows_time_to_unix_time_msec(
+        &file_info.BasicInformation.ChangeTime,
+      ) as u64);
+
+      if file_info.BasicInformation.FileAttributes
+        & winapi::um::winnt::FILE_ATTRIBUTE_REPARSE_POINT
+        != 0
+      {
+        fsstat.is_symlink = true;
+      }
+
+      if file_info.BasicInformation.FileAttributes
+        & winapi::um::winnt::FILE_ATTRIBUTE_DIRECTORY
+        != 0
+      {
+        fsstat.mode |= libc::S_IFDIR as u32;
+        fsstat.size = 0;
+      } else {
+        fsstat.mode |= libc::S_IFREG as u32;
+        fsstat.size = file_info.StandardInformation.EndOfFile as u64;
+      }
+
+      if file_info.BasicInformation.FileAttributes
+        & winapi::um::winnt::FILE_ATTRIBUTE_READONLY
+        != 0
+      {
+        fsstat.mode |=
+          (libc::S_IREAD | (libc::S_IREAD >> 3) | (libc::S_IREAD >> 6)) as u32;
+      } else {
+        fsstat.mode |= ((libc::S_IREAD | libc::S_IWRITE)
+          | ((libc::S_IREAD | libc::S_IWRITE) >> 3)
+          | ((libc::S_IREAD | libc::S_IWRITE) >> 6))
+          as u32;
+      }
+    }
+
+    Ok(())
+  }
 }

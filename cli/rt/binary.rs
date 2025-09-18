@@ -8,35 +8,34 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use deno_core::anyhow::bail;
+use deno_core::FastString;
+use deno_core::ModuleCodeBytes;
+use deno_core::ModuleSourceCode;
+use deno_core::ModuleType;
 use deno_core::anyhow::Context;
+use deno_core::anyhow::bail;
 use deno_core::error::AnyError;
 use deno_core::serde_json;
 use deno_core::url::Url;
-use deno_core::FastString;
-use deno_core::ModuleSourceCode;
-use deno_core::ModuleType;
 use deno_error::JsError;
 use deno_error::JsErrorBox;
 use deno_lib::standalone::binary::DenoRtDeserializable;
+use deno_lib::standalone::binary::MAGIC_BYTES;
 use deno_lib::standalone::binary::Metadata;
 use deno_lib::standalone::binary::RemoteModuleEntry;
 use deno_lib::standalone::binary::SpecifierDataStore;
 use deno_lib::standalone::binary::SpecifierId;
-use deno_lib::standalone::binary::MAGIC_BYTES;
 use deno_lib::standalone::virtual_fs::VirtualDirectory;
 use deno_lib::standalone::virtual_fs::VirtualDirectoryEntries;
 use deno_media_type::MediaType;
+use deno_npm::NpmPackageId;
 use deno_npm::resolution::SerializedNpmResolutionSnapshot;
 use deno_npm::resolution::SerializedNpmResolutionSnapshotPackage;
 use deno_npm::resolution::ValidSerializedNpmResolutionSnapshot;
-use deno_npm::NpmPackageId;
-use deno_runtime::deno_fs::FileSystem;
-use deno_runtime::deno_fs::RealFs;
-use deno_runtime::deno_io::fs::FsError;
-use deno_semver::package::PackageReq;
 use deno_semver::StackString;
+use deno_semver::package::PackageReq;
 use indexmap::IndexMap;
+use sys_traits::FsRead;
 use thiserror::Error;
 
 use crate::file_system::FileBackedVfs;
@@ -56,11 +55,9 @@ pub struct StandaloneData {
 /// then checking for the magic trailer string `d3n0l4nd`. If found,
 /// the bundle is executed. If not, this function exits with `Ok(None)`.
 pub fn extract_standalone(
-  cli_args: Cow<Vec<OsString>>,
-) -> Result<Option<StandaloneData>, AnyError> {
-  let Some(data) = libsui::find_section("d3n0l4nd") else {
-    return Ok(None);
-  };
+  cli_args: Cow<[OsString]>,
+) -> Result<StandaloneData, AnyError> {
+  let data = find_section()?;
 
   let root_path = {
     let maybe_current_exe = std::env::current_exe().ok();
@@ -80,10 +77,7 @@ pub fn extract_standalone(
     modules_store: remote_modules,
     vfs_root_entries,
     vfs_files_data,
-  } = match deserialize_binary_data_section(&root_url, data)? {
-    Some(data_section) => data_section,
-    None => return Ok(None),
-  };
+  } = deserialize_binary_data_section(&root_url, data)?;
 
   let cli_args = cli_args.into_owned();
   metadata.argv.reserve(cli_args.len() - 1);
@@ -94,7 +88,11 @@ pub fn extract_standalone(
     let fs_root = VfsRoot {
       dir: VirtualDirectory {
         // align the name of the directory with the root dir
-        name: root_path.file_name().unwrap().to_string_lossy().to_string(),
+        name: root_path
+          .file_name()
+          .unwrap()
+          .to_string_lossy()
+          .into_owned(),
         entries: vfs_root_entries,
       },
       root_path: root_path.clone(),
@@ -106,7 +104,7 @@ pub fn extract_standalone(
       metadata.vfs_case_sensitivity,
     ))
   };
-  Ok(Some(StandaloneData {
+  Ok(StandaloneData {
     metadata,
     modules: Arc::new(StandaloneModules {
       modules: remote_modules,
@@ -115,7 +113,84 @@ pub fn extract_standalone(
     npm_snapshot,
     root_path,
     vfs,
-  }))
+  })
+}
+
+fn find_section() -> Result<&'static [u8], AnyError> {
+  #[cfg(windows)]
+  if std::env::var_os("DENO_INTERNAL_RT_USE_FILE_FALLBACK").is_some() {
+    return read_from_file_fallback();
+  }
+
+  match libsui::find_section("d3n0l4nd")
+    .context("Failed reading standalone binary section.")
+  {
+    Ok(Some(data)) => Ok(data),
+    Ok(None) => bail!("Could not find standalone binary section."),
+    Err(err) => {
+      #[cfg(windows)]
+      if let Ok(data) = read_from_file_fallback() {
+        return Ok(data);
+      }
+
+      Err(err)
+    }
+  }
+}
+
+/// This is a temporary hacky fallback until we can find
+/// a fix for https://github.com/denoland/deno/issues/28982
+#[cfg(windows)]
+fn read_from_file_fallback() -> Result<&'static [u8], AnyError> {
+  use std::sync::OnceLock;
+
+  fn find_in_bytes(bytes: &[u8], needle: &[u8]) -> Option<usize> {
+    bytes.windows(needle.len()).position(|n| n == needle)
+  }
+
+  static FILE: OnceLock<std::fs::File> = OnceLock::new();
+  static MMAP_FILE: OnceLock<memmap2::Mmap> = OnceLock::new();
+
+  // DENOLAND in utf16
+  const RESOURCE_SECTION_HEADER_NAME: &[u8] = &[
+    0x44, 0x00, 0x33, 0x00, 0x4E, 0x00, 0x30, 0x00, 0x4C, 0x00, 0x34, 0x00,
+    0x4E, 0x00, 0x44, 0x00,
+  ];
+  const MAGIC_BYTES: &[u8] = b"d3n0l4nd";
+
+  let file_path = std::env::current_exe()?;
+  let file = FILE.get_or_init(|| std::fs::File::open(file_path).unwrap());
+  let mmap = MMAP_FILE.get_or_init(|| {
+    // SAFETY: memory mapped file creation
+    unsafe { memmap2::Mmap::map(file).unwrap() }
+  });
+
+  // the code in this file will cause this to appear twice in the binary,
+  // so skip over the first one
+  let Some(marker_pos) = find_in_bytes(mmap, RESOURCE_SECTION_HEADER_NAME)
+  else {
+    bail!("Failed to find first section name.");
+  };
+  let next_bytes = &mmap[marker_pos + RESOURCE_SECTION_HEADER_NAME.len()..];
+  let Some(marker_pos) =
+    find_in_bytes(next_bytes, RESOURCE_SECTION_HEADER_NAME)
+  else {
+    bail!("Failed to find second section name.");
+  };
+  let next_bytes =
+    &next_bytes[marker_pos + RESOURCE_SECTION_HEADER_NAME.len()..];
+  let Some(ascii_pos) = find_in_bytes(next_bytes, MAGIC_BYTES) else {
+    bail!("Failed to find first magic bytes.");
+  };
+  let next_bytes = &next_bytes[ascii_pos..];
+  let Some(last_pos) = next_bytes
+    .windows(MAGIC_BYTES.len())
+    .rposition(|w| w == MAGIC_BYTES)
+  else {
+    bail!("Failed to find end magic bytes.")
+  };
+
+  Ok(&next_bytes[..last_pos + MAGIC_BYTES.len()])
 }
 
 pub struct DeserializedDataSection {
@@ -129,7 +204,7 @@ pub struct DeserializedDataSection {
 pub fn deserialize_binary_data_section(
   root_dir_url: &Url,
   data: &'static [u8],
-) -> Result<Option<DeserializedDataSection>, AnyError> {
+) -> Result<DeserializedDataSection, AnyError> {
   fn read_magic_bytes(input: &[u8]) -> Result<(&[u8], bool), AnyError> {
     if input.len() < MAGIC_BYTES.len() {
       bail!("Unexpected end of data. Could not find magic bytes.");
@@ -143,7 +218,7 @@ pub fn deserialize_binary_data_section(
 
   let (input, found) = read_magic_bytes(data)?;
   if !found {
-    return Ok(None);
+    bail!("Did not find magic bytes.");
   }
 
   // 1. Metadata
@@ -181,7 +256,7 @@ pub fn deserialize_binary_data_section(
   // finally ensure we read the magic bytes at the end
   let (_input, found) = read_magic_bytes(input)?;
   if !found {
-    bail!("Could not find magic bytes at the end of the data.");
+    bail!("Could not find magic bytes at end of data.");
   }
 
   let modules_store = RemoteModulesStore::new(
@@ -190,13 +265,13 @@ pub fn deserialize_binary_data_section(
     remote_modules_store,
   );
 
-  Ok(Some(DeserializedDataSection {
+  Ok(DeserializedDataSection {
     metadata,
     npm_snapshot,
     modules_store,
     vfs_root_entries,
     vfs_files_data,
-  }))
+  })
 }
 
 struct SpecifierStore {
@@ -276,12 +351,14 @@ impl StandaloneModules {
       let mut transpiled = None;
       let mut source_map = None;
       let mut cjs_export_analysis = None;
+      let mut is_valid_utf8 = false;
       let bytes = match self.vfs.file_entry(&path) {
         Ok(entry) => {
           let bytes = self
             .vfs
             .read_file_all(entry)
             .map_err(JsErrorBox::from_err)?;
+          is_valid_utf8 = entry.is_valid_utf8;
           transpiled = entry
             .transpiled_offset
             .and_then(|t| self.vfs.read_file_offset_with_len(t).ok());
@@ -294,10 +371,12 @@ impl StandaloneModules {
           bytes
         }
         Err(err) if err.kind() == ErrorKind::NotFound => {
-          match RealFs.read_file_sync(&path, None) {
+          // actually use the real file system here
+          #[allow(clippy::disallowed_types)]
+          match sys_traits::impls::RealSys.fs_read(&path) {
             Ok(bytes) => bytes,
-            Err(FsError::Io(err)) if err.kind() == ErrorKind::NotFound => {
-              return Ok(None)
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+              return Ok(None);
             }
             Err(err) => return Err(JsErrorBox::from_err(err)),
           }
@@ -307,6 +386,7 @@ impl StandaloneModules {
       Ok(Some(DenoCompileModuleData {
         media_type: MediaType::from_specifier(specifier),
         specifier,
+        is_valid_utf8,
         data: bytes,
         transpiled,
         source_map,
@@ -321,6 +401,7 @@ impl StandaloneModules {
 pub struct DenoCompileModuleData<'a> {
   pub specifier: &'a Url,
   pub media_type: MediaType,
+  pub is_valid_utf8: bool,
   pub data: Cow<'static, [u8]>,
   pub transpiled: Option<Cow<'static, [u8]>>,
   pub source_map: Option<Cow<'static, [u8]>>,
@@ -329,12 +410,18 @@ pub struct DenoCompileModuleData<'a> {
 
 impl<'a> DenoCompileModuleData<'a> {
   pub fn into_parts(self) -> (&'a Url, ModuleType, DenoCompileModuleSource) {
-    fn into_string_unsafe(data: Cow<'static, [u8]>) -> DenoCompileModuleSource {
+    fn into_string_unsafe(
+      is_valid_utf8: bool,
+      data: Cow<'static, [u8]>,
+    ) -> DenoCompileModuleSource {
       match data {
-        Cow::Borrowed(d) => DenoCompileModuleSource::String(
-          // SAFETY: we know this is a valid utf8 string
-          unsafe { std::str::from_utf8_unchecked(d) },
-        ),
+        Cow::Borrowed(d) if is_valid_utf8 => {
+          DenoCompileModuleSource::String(
+            // SAFETY: we know this is a valid utf8 string
+            unsafe { std::str::from_utf8_unchecked(d) },
+          )
+        }
+        Cow::Borrowed(_) => DenoCompileModuleSource::Bytes(data),
         Cow::Owned(d) => DenoCompileModuleSource::Bytes(Cow::Owned(d)),
       }
     }
@@ -351,8 +438,14 @@ impl<'a> DenoCompileModuleData<'a> {
       | MediaType::Dts
       | MediaType::Dmts
       | MediaType::Dcts
-      | MediaType::Tsx => (ModuleType::JavaScript, into_string_unsafe(data)),
-      MediaType::Json => (ModuleType::Json, into_string_unsafe(data)),
+      | MediaType::Tsx => (
+        ModuleType::JavaScript,
+        into_string_unsafe(self.is_valid_utf8, data),
+      ),
+      MediaType::Json => (
+        ModuleType::Json,
+        into_string_unsafe(self.is_valid_utf8, data),
+      ),
       MediaType::Wasm => {
         (ModuleType::Wasm, DenoCompileModuleSource::Bytes(data))
       }
@@ -369,6 +462,7 @@ impl<'a> DenoCompileModuleData<'a> {
   }
 }
 
+#[derive(Debug)]
 pub enum DenoCompileModuleSource {
   String(&'static str),
   Bytes(Cow<'static, [u8]>),
@@ -376,20 +470,27 @@ pub enum DenoCompileModuleSource {
 
 impl DenoCompileModuleSource {
   pub fn into_for_v8(self) -> ModuleSourceCode {
-    fn into_bytes(data: Cow<'static, [u8]>) -> ModuleSourceCode {
-      ModuleSourceCode::Bytes(match data {
-        Cow::Borrowed(d) => d.into(),
-        Cow::Owned(d) => d.into_boxed_slice().into(),
-      })
-    }
-
     match self {
       // todo(https://github.com/denoland/deno_core/pull/943): store whether
       // the string is ascii or not ahead of time so we can avoid the is_ascii()
       // check in FastString::from_static
       Self::String(s) => ModuleSourceCode::String(FastString::from_static(s)),
-      Self::Bytes(b) => into_bytes(b),
+      Self::Bytes(b) => ModuleSourceCode::Bytes(module_source_into_bytes(b)),
     }
+  }
+
+  pub fn into_bytes_for_v8(self) -> ModuleCodeBytes {
+    match self {
+      DenoCompileModuleSource::String(text) => text.as_bytes().into(),
+      DenoCompileModuleSource::Bytes(b) => module_source_into_bytes(b),
+    }
+  }
+}
+
+fn module_source_into_bytes(data: Cow<'static, [u8]>) -> ModuleCodeBytes {
+  match data {
+    Cow::Borrowed(d) => d.into(),
+    Cow::Owned(d) => d.into_boxed_slice().into(),
   }
 }
 
@@ -486,6 +587,7 @@ impl RemoteModulesStore {
               self.specifiers.get_specifier(specifier).unwrap()
             },
             media_type: entry.media_type,
+            is_valid_utf8: entry.is_valid_utf8,
             data: handle_cow_ref(&entry.data),
             transpiled: entry.maybe_transpiled.as_ref().map(handle_cow_ref),
             source_map: entry.maybe_source_map.as_ref().map(handle_cow_ref),
@@ -672,7 +774,7 @@ fn check_has_len(input: &[u8], len: usize) -> std::io::Result<()> {
   }
 }
 
-fn read_string_lossy(input: &[u8]) -> std::io::Result<(&[u8], Cow<str>)> {
+fn read_string_lossy(input: &[u8]) -> std::io::Result<(&[u8], Cow<'_, str>)> {
   let (input, data_bytes) = read_bytes_with_u32_len(input)?;
   Ok((input, String::from_utf8_lossy(data_bytes)))
 }

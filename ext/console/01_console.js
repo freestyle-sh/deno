@@ -634,7 +634,10 @@ function formatRaw(ctx, value, recurseTimes, typedArray, proxyDetails) {
     protoProps = undefined;
   }
 
-  let tag = value[SymbolToStringTag];
+  let tag;
+  if (!proxyDetails) {
+    tag = value[SymbolToStringTag];
+  }
   // Only list the tag in case it's non-enumerable / not an own property.
   // Otherwise we'd print this twice.
   if (
@@ -3401,14 +3404,14 @@ class Console {
     if (label.length > 0) {
       this.log(...new SafeArrayIterator(label));
     }
-    this.indentLevel += 2;
+    this.indentLevel++;
   };
 
   groupCollapsed = this.group;
 
   groupEnd = () => {
     if (this.indentLevel > 0) {
-      this.indentLevel -= 2;
+      this.indentLevel--;
     }
   };
 

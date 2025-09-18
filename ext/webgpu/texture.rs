@@ -1,9 +1,9 @@
 // Copyright 2018-2025 the Deno authors. MIT license.
 
-use deno_core::op2;
-use deno_core::webidl::WebIdlInterfaceConverter;
 use deno_core::GarbageCollected;
 use deno_core::WebIDL;
+use deno_core::op2;
+use deno_core::webidl::WebIdlInterfaceConverter;
 use deno_error::JsErrorBox;
 use wgpu_types::AstcBlock;
 use wgpu_types::AstcChannel;
@@ -14,6 +14,7 @@ use wgpu_types::TextureFormat;
 use wgpu_types::TextureViewDimension;
 
 use crate::Instance;
+use crate::error::GPUGenericError;
 
 #[derive(WebIDL)]
 #[webidl(dictionary)]
@@ -65,10 +66,23 @@ impl WebIdlInterfaceConverter for GPUTexture {
   const NAME: &'static str = "GPUTexture";
 }
 
-impl GarbageCollected for GPUTexture {}
+// SAFETY: we're sure this can be GCed
+unsafe impl GarbageCollected for GPUTexture {
+  fn trace(&self, _visitor: &mut deno_core::v8::cppgc::Visitor) {}
+
+  fn get_name(&self) -> &'static std::ffi::CStr {
+    c"GPUTexture"
+  }
+}
 
 #[op2]
 impl GPUTexture {
+  #[constructor]
+  #[cppgc]
+  fn constructor(_: bool) -> Result<GPUTexture, GPUGenericError> {
+    Err(GPUGenericError::InvalidConstructor)
+  }
+
   #[getter]
   #[string]
   fn label(&self) -> String {
@@ -248,11 +262,24 @@ impl WebIdlInterfaceConverter for GPUTextureView {
   const NAME: &'static str = "GPUTextureView";
 }
 
-impl GarbageCollected for GPUTextureView {}
+// SAFETY: we're sure this can be GCed
+unsafe impl GarbageCollected for GPUTextureView {
+  fn trace(&self, _visitor: &mut deno_core::v8::cppgc::Visitor) {}
+
+  fn get_name(&self) -> &'static std::ffi::CStr {
+    c"GPUTextureView"
+  }
+}
 // TODO(@crowlKats): weakref in texture for view
 
 #[op2]
 impl GPUTextureView {
+  #[constructor]
+  #[cppgc]
+  fn constructor(_: bool) -> Result<GPUTextureView, GPUGenericError> {
+    Err(GPUGenericError::InvalidConstructor)
+  }
+
   #[getter]
   #[string]
   fn label(&self) -> String {

@@ -218,10 +218,76 @@ declare var EventTarget: {
 
 /** @category Events */
 interface EventListener {
+  /**
+   * The `EventListener` interface represents a callback function to be called
+   * whenever an event of a specific type occurs on a target object.
+   *
+   * This is a basic event listener, represented by a simple function
+   * that receives an Event object as its only parameter.
+   *
+   * @example
+   * ```ts
+   * // Create an event listener function
+   * const handleEvent = (event: Event) => {
+   *   console.log(`Event of type "${event.type}" occurred`);
+   *   console.log(`Event phase: ${event.eventPhase}`);
+   *
+   *   // Access event properties
+   *   if (event.cancelable) {
+   *     event.preventDefault();
+   *   }
+   * };
+   *
+   * // Attach the event listener to a target
+   * const target = new EventTarget();
+   * target.addEventListener('custom', handleEvent);
+   *
+   * // Or create a listener inline
+   * target.addEventListener('message', (event) => {
+   *   console.log('Message received:', event);
+   * });
+   * ```
+   *
+   * @category Events
+   */
   (evt: Event): void;
 }
 
-/** @category Events */
+/**
+ * The `EventListenerObject` interface represents an object that can handle events
+ * dispatched by an `EventTarget` object.
+ *
+ * This interface provides an alternative to using a function as an event listener.
+ * When implementing an object with this interface, the `handleEvent()` method
+ * will be called when the event is triggered.
+ *
+ * @example
+ * ```ts
+ * // Creating an object that implements `EventListenerObject`
+ * const myEventListener = {
+ *   handleEvent(event) {
+ *     console.log(`Event of type ${event.type} occurred`);
+ *
+ *     // You can use 'this' to access other methods or properties
+ *     this.additionalProcessing(event);
+ *   },
+ *
+ *   additionalProcessing(event) {
+ *     // Additional event handling logic
+ *     console.log('Additional processing for:', event);
+ *   }
+ * };
+ *
+ * // Using with any EventTarget (server or client contexts)
+ * const target = new EventTarget();
+ * target.addEventListener('message', myEventListener);
+ *
+ * // Later, to remove it:
+ * target.removeEventListener('message', myEventListener);
+ * ```
+ *
+ * @category Events
+ */
 interface EventListenerObject {
   handleEvent(evt: Event): void;
 }
@@ -231,10 +297,48 @@ type EventListenerOrEventListenerObject =
   | EventListener
   | EventListenerObject;
 
-/** @category Events */
+/**
+ * Options for configuring an event listener via `addEventListener`.
+ *
+ * This interface extends `EventListenerOptions` and provides additional configuration
+ * options to control event listener behavior.
+ *
+ * @example
+ * ```ts
+ * eventTarget.addEventListener('message', handler, {
+ *   once: true,
+ *   passive: true,
+ *   signal: controller.signal
+ * });
+ * ```
+ *
+ * @category Events */
 interface AddEventListenerOptions extends EventListenerOptions {
+  /**
+   * When set to true, the listener will automatically be removed after it has been invoked once.
+   */
   once?: boolean;
+
+  /**
+   * When set to true, indicates that the listener will never call `preventDefault()`.
+   * This provides a performance optimization opportunity for event processing.
+   * If a passive listener attempts to call `preventDefault()`, the call will be ignored
+   * and a warning may be generated.
+   */
   passive?: boolean;
+
+  /**
+   * An `AbortSignal` that can be used to remove the event listener when aborted.
+   *
+   * @example
+   * ```ts
+   * const controller = new AbortController();
+   * eventTarget.addEventListener('message', handler, { signal: controller.signal });
+   *
+   * // Later, to remove the listener:
+   * controller.abort();
+   * ```
+   */
   signal?: AbortSignal;
 }
 
@@ -323,7 +427,7 @@ interface TextDecoder extends TextDecoderCommon {
   /** Turns binary data, often in the form of a Uint8Array, into a string given
    * the encoding.
    */
-  decode(input?: BufferSource, options?: TextDecodeOptions): string;
+  decode(input?: AllowSharedBufferSource, options?: TextDecodeOptions): string;
 }
 
 /** @category Encoding */
@@ -348,12 +452,6 @@ interface TextEncoderEncodeIntoResult {
   written: number;
 }
 
-/** @category Encoding */
-interface TextEncoder extends TextEncoderCommon {
-  /** Returns the result of running UTF-8's encoder. */
-  encode(input?: string): Uint8Array;
-  encodeInto(input: string, dest: Uint8Array): TextEncoderEncodeIntoResult;
-}
 /**
  * Allows you to convert a string into binary data (in the form of a Uint8Array)
  * given the encoding.
@@ -370,10 +468,13 @@ interface TextEncoder extends TextEncoderCommon {
  */
 interface TextEncoder extends TextEncoderCommon {
   /** Turns a string into binary data (in the form of a Uint8Array) using UTF-8 encoding. */
-  encode(input?: string): Uint8Array;
+  encode(input?: string): Uint8Array<ArrayBuffer>;
 
   /** Encodes a string into the destination Uint8Array and returns the result of the encoding. */
-  encodeInto(input: string, dest: Uint8Array): TextEncoderEncodeIntoResult;
+  encodeInto(
+    input: string,
+    dest: Uint8Array<ArrayBufferLike>,
+  ): TextEncoderEncodeIntoResult;
 }
 
 /** @category Encoding */
@@ -391,7 +492,7 @@ interface TextEncoderCommon {
 /** @category Encoding */
 interface TextDecoderStream extends GenericTransformStream, TextDecoderCommon {
   readonly readable: ReadableStream<string>;
-  readonly writable: WritableStream<BufferSource>;
+  readonly writable: WritableStream<AllowSharedBufferSource>;
 }
 
 /** @category Encoding */
@@ -402,7 +503,7 @@ declare var TextDecoderStream: {
 
 /** @category Encoding */
 interface TextEncoderStream extends GenericTransformStream, TextEncoderCommon {
-  readonly readable: ReadableStream<Uint8Array>;
+  readonly readable: ReadableStream<Uint8Array<ArrayBuffer>>;
   readonly writable: WritableStream<string>;
 }
 
@@ -580,9 +681,9 @@ interface Blob {
   readonly size: number;
   readonly type: string;
   arrayBuffer(): Promise<ArrayBuffer>;
-  bytes(): Promise<Uint8Array>;
+  bytes(): Promise<Uint8Array<ArrayBuffer>>;
   slice(start?: number, end?: number, contentType?: string): Blob;
-  stream(): ReadableStream<Uint8Array>;
+  stream(): ReadableStream<Uint8Array<ArrayBuffer>>;
   text(): Promise<string>;
 }
 
@@ -687,7 +788,9 @@ interface ReadableStreamBYOBReader extends ReadableStreamGenericReader {
 /** @category Streams */
 declare var ReadableStreamBYOBReader: {
   readonly prototype: ReadableStreamBYOBReader;
-  new (stream: ReadableStream<Uint8Array>): ReadableStreamBYOBReader;
+  new (
+    stream: ReadableStream<Uint8Array<ArrayBuffer>>,
+  ): ReadableStreamBYOBReader;
 };
 
 /** @category Streams */
@@ -872,7 +975,7 @@ declare var ReadableStream: {
   new (
     underlyingSource: UnderlyingByteSource,
     strategy?: { highWaterMark?: number },
-  ): ReadableStream<Uint8Array>;
+  ): ReadableStream<Uint8Array<ArrayBuffer>>;
   new <R = any>(
     underlyingSource: UnderlyingDefaultSource<R>,
     strategy?: QueuingStrategy<R>,
@@ -1252,7 +1355,7 @@ declare function structuredClone<T = any>(
  * @category Streams
  */
 interface CompressionStream extends GenericTransformStream {
-  readonly readable: ReadableStream<Uint8Array>;
+  readonly readable: ReadableStream<Uint8Array<ArrayBuffer>>;
   readonly writable: WritableStream<BufferSource>;
 }
 
@@ -1299,7 +1402,7 @@ declare var CompressionStream: {
  * @category Streams
  */
 interface DecompressionStream extends GenericTransformStream {
-  readonly readable: ReadableStream<Uint8Array>;
+  readonly readable: ReadableStream<Uint8Array<ArrayBuffer>>;
   readonly writable: WritableStream<BufferSource>;
 }
 
@@ -1362,7 +1465,7 @@ interface ImageDataSettings {
 /** @category Platform */
 interface ImageData {
   readonly colorSpace: PredefinedColorSpace;
-  readonly data: Uint8ClampedArray;
+  readonly data: Uint8ClampedArray<ArrayBuffer>;
   readonly height: number;
   readonly width: number;
 }
@@ -1372,7 +1475,7 @@ declare var ImageData: {
   readonly prototype: ImageData;
   new (sw: number, sh: number, settings?: ImageDataSettings): ImageData;
   new (
-    data: Uint8ClampedArray,
+    data: Uint8ClampedArray<ArrayBuffer>,
     sw: number,
     sh?: number,
     settings?: ImageDataSettings,

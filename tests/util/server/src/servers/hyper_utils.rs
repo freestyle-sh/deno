@@ -17,6 +17,7 @@ use http::Response;
 use http_body_util::combinators::UnsyncBoxBody;
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
+use tokio::net::TcpStream;
 
 #[derive(Debug, Clone, Copy)]
 pub enum ServerKind {
@@ -75,7 +76,8 @@ pub async fn run_server_with_acceptor<A, F, S>(
   error_msg: &'static str,
   kind: ServerKind,
 ) where
-  A: Stream<Item = io::Result<rustls_tokio_stream::TlsStream>> + ?Sized,
+  A: Stream<Item = io::Result<rustls_tokio_stream::TlsStream<TcpStream>>>
+    + ?Sized,
   F: Fn(Request<hyper::body::Incoming>) -> S + Copy + 'static,
   S: Future<Output = HandlerOutput> + 'static,
 {
@@ -97,6 +99,42 @@ pub async fn run_server_with_acceptor<A, F, S>(
     #[allow(clippy::print_stderr)]
     if !err_str.contains("early eof") {
       eprintln!("{}: {:?}", error_msg, e);
+    }
+  }
+}
+
+pub async fn run_server_with_remote_addr<F, S>(
+  options: ServerOptions,
+  handler: F,
+) where
+  F: Fn(Request<hyper::body::Incoming>, SocketAddr) -> S + Copy + 'static,
+  S: Future<Output = HandlerOutput> + 'static,
+{
+  let fut: Pin<Box<dyn Future<Output = Result<(), anyhow::Error>>>> =
+    async move {
+      let listener = TcpListener::bind(options.addr).await?;
+      #[allow(clippy::print_stdout)]
+      {
+        println!("ready: {}", options.addr);
+      }
+      loop {
+        let (stream, addr) = listener.accept().await?;
+        let io = TokioIo::new(stream);
+        deno_unsync::spawn(hyper_serve_connection(
+          io,
+          move |req| handler(req, addr),
+          options.error_msg,
+          options.kind,
+        ));
+      }
+    }
+    .boxed_local();
+
+  if let Err(e) = fut.await {
+    let err_str = e.to_string();
+    #[allow(clippy::print_stderr)]
+    if !err_str.contains("early eof") {
+      eprintln!("{}: {:?}", options.error_msg, e);
     }
   }
 }

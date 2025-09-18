@@ -2,16 +2,20 @@
 
 use std::cell::RefCell;
 
-use deno_core::op2;
-use deno_core::v8;
+use deno_core::_ops::make_cppgc_object;
 use deno_core::GarbageCollected;
 use deno_core::WebIDL;
-use deno_core::_ops::make_cppgc_object;
-use deno_core::cppgc::Ptr;
+use deno_core::cppgc::Member;
+use deno_core::cppgc::Ref;
+use deno_core::op2;
+use deno_core::v8;
+use deno_core::v8::TracedReference;
+use deno_core::v8::cppgc::Visitor;
 use deno_error::JsErrorBox;
 use wgpu_types::SurfaceStatus;
 
 use crate::device::GPUDevice;
+use crate::error::GPUGenericError;
 use crate::texture::GPUTexture;
 use crate::texture::GPUTextureFormat;
 
@@ -29,9 +33,22 @@ pub enum SurfaceError {
 }
 
 pub struct Configuration {
-  pub device: Ptr<GPUDevice>,
+  pub device: Member<GPUDevice>,
   pub usage: u32,
   pub format: GPUTextureFormat,
+  pub surface_config:
+    wgpu_types::SurfaceConfiguration<Vec<wgpu_types::TextureFormat>>,
+}
+
+// SAFETY: we're sure this can be GCed
+unsafe impl GarbageCollected for Configuration {
+  fn trace(&self, visitor: &mut Visitor) {
+    visitor.trace(&self.device);
+  }
+
+  fn get_name(&self) -> &'static std::ffi::CStr {
+    c"GPUCanvasContextConfiguration"
+  }
 }
 
 pub struct GPUCanvasContext {
@@ -40,15 +57,34 @@ pub struct GPUCanvasContext {
   pub height: RefCell<u32>,
 
   pub config: RefCell<Option<Configuration>>,
-  pub texture: RefCell<Option<v8::Global<v8::Object>>>,
+  pub texture: RefCell<TracedReference<v8::Object>>,
 
   pub canvas: v8::Global<v8::Object>,
 }
 
-impl GarbageCollected for GPUCanvasContext {}
+// SAFETY: we're sure this can be GCed
+unsafe impl GarbageCollected for GPUCanvasContext {
+  fn trace(&self, visitor: &mut Visitor) {
+    if let Some(config) = &*self.config.borrow() {
+      config.trace(visitor);
+    }
+
+    visitor.trace(&*self.texture.borrow());
+  }
+
+  fn get_name(&self) -> &'static std::ffi::CStr {
+    c"GPUCanvasContext"
+  }
+}
 
 #[op2]
 impl GPUCanvasContext {
+  #[constructor]
+  #[cppgc]
+  fn constructor(_: bool) -> Result<GPUCanvasContext, GPUGenericError> {
+    Err(GPUGenericError::InvalidConstructor)
+  }
+
   #[getter]
   #[global]
   fn canvas(&self) -> v8::Global<v8::Object> {
@@ -90,9 +126,10 @@ impl GPUCanvasContext {
     device.error_handler.push_error(err);
 
     self.config.borrow_mut().replace(Configuration {
-      device,
+      device: device.into(),
       usage: configuration.usage,
       format: configuration.format,
+      surface_config: conf,
     });
 
     Ok(())
@@ -103,19 +140,18 @@ impl GPUCanvasContext {
     *self.config.borrow_mut() = None;
   }
 
-  #[global]
-  fn get_current_texture(
+  fn get_current_texture<'s>(
     &self,
-    scope: &mut v8::HandleScope,
-  ) -> Result<v8::Global<v8::Object>, SurfaceError> {
+    scope: &mut v8::HandleScope<'s>,
+  ) -> Result<v8::Local<'s, v8::Object>, SurfaceError> {
     let config = self.config.borrow();
     let Some(config) = config.as_ref() else {
       return Err(SurfaceError::UnconfiguredContext);
     };
 
     {
-      if let Some(obj) = self.texture.borrow().as_ref() {
-        return Ok(obj.clone());
+      if let Some(obj) = self.texture.borrow().get(scope) {
+        return Ok(obj);
       }
     }
 
@@ -147,8 +183,7 @@ impl GPUCanvasContext {
           usage: config.usage,
         };
         let obj = make_cppgc_object(scope, texture);
-        let obj = v8::Global::new(scope, obj);
-        *self.texture.borrow_mut() = Some(obj.clone());
+        self.texture.borrow_mut().reset(scope, Some(obj));
 
         Ok(obj)
       }
@@ -158,7 +193,10 @@ impl GPUCanvasContext {
 }
 
 impl GPUCanvasContext {
-  pub fn present(&self) -> Result<(), SurfaceError> {
+  pub fn present(
+    &self,
+    scope: &mut v8::HandleScope,
+  ) -> Result<(), SurfaceError> {
     let config = self.config.borrow();
     let Some(config) = config.as_ref() else {
       return Err(SurfaceError::UnconfiguredContext);
@@ -167,16 +205,37 @@ impl GPUCanvasContext {
     config.device.instance.surface_present(self.surface_id)?;
 
     // next `get_current_texture` call would get a new texture
-    *self.texture.borrow_mut() = None;
+    self.texture.borrow_mut().reset(scope, None);
 
     Ok(())
+  }
+
+  pub fn resize_configure(&self, width: u32, height: u32) {
+    self.width.replace(width);
+    self.height.replace(height);
+
+    let mut config = self.config.borrow_mut();
+    let Some(config) = &mut *config else {
+      return;
+    };
+
+    config.surface_config.width = width;
+    config.surface_config.height = height;
+
+    let err = config.device.instance.surface_configure(
+      self.surface_id,
+      config.device.id,
+      &config.surface_config,
+    );
+
+    config.device.error_handler.push_error(err);
   }
 }
 
 #[derive(WebIDL)]
 #[webidl(dictionary)]
 struct GPUCanvasConfiguration {
-  device: Ptr<GPUDevice>,
+  device: Ref<GPUDevice>,
   format: GPUTextureFormat,
   #[webidl(default = wgpu_types::TextureUsages::RENDER_ATTACHMENT.bits())]
   #[options(enforce_range = true)]

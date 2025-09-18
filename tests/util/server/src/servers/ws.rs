@@ -1,7 +1,7 @@
 // Copyright 2018-2025 the Deno authors. MIT license.
 
-use std::future::poll_fn;
 use std::future::Future;
+use std::future::poll_fn;
 use std::pin::Pin;
 use std::result::Result;
 
@@ -12,25 +12,26 @@ use fastwebsockets::Frame;
 use fastwebsockets::OpCode;
 use fastwebsockets::Role;
 use fastwebsockets::WebSocket;
-use futures::future::join3;
 use futures::StreamExt;
-use h2::server::Handshake;
-use h2::server::SendResponse;
+use futures::future::join3;
 use h2::Reason;
 use h2::RecvStream;
-use hyper::upgrade::Upgraded;
+use h2::server::Handshake;
+use h2::server::SendResponse;
+use http_body_util::Empty;
 use hyper::Method;
 use hyper::Request;
 use hyper::Response;
 use hyper::StatusCode;
+use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
 use pretty_assertions::assert_eq;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 
+use super::SupportedHttpVersions;
 use super::get_tcp_listener_stream;
 use super::get_tls_listener_stream;
-use super::SupportedHttpVersions;
 
 pub async fn run_ws_server(port: u16) {
   let mut tcp = get_tcp_listener_stream("ws", port).await;
@@ -149,6 +150,13 @@ where
 {
   let service = hyper::service::service_fn(
     move |mut req: http::Request<hyper::body::Incoming>| async move {
+      if req.headers().get("user-agent").is_none() {
+        return Response::builder()
+          .status(StatusCode::BAD_REQUEST)
+          .body(Empty::new())
+          .map_err(|e| anyhow!("Error creating response: {}", e));
+      }
+
       let (response, upgrade_fut) = fastwebsockets::upgrade::upgrade(&mut req)
         .map_err(|e| anyhow!("Error upgrading websocket connection: {}", e))?;
 
