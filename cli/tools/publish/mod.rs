@@ -9,23 +9,25 @@ use std::process::Stdio;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
+use base64::prelude::BASE64_STANDARD;
 use deno_ast::ModuleSpecifier;
+use deno_ast::SourceTextInfo;
 use deno_config::deno_json::ConfigFile;
 use deno_config::workspace::JsrPackageConfig;
 use deno_config::workspace::Workspace;
-use deno_core::anyhow::bail;
 use deno_core::anyhow::Context;
+use deno_core::anyhow::bail;
 use deno_core::error::AnyError;
-use deno_core::futures::future::LocalBoxFuture;
-use deno_core::futures::stream::FuturesUnordered;
 use deno_core::futures::FutureExt;
 use deno_core::futures::StreamExt;
+use deno_core::futures::future::LocalBoxFuture;
+use deno_core::futures::stream::FuturesUnordered;
 use deno_core::serde_json;
-use deno_core::serde_json::json;
 use deno_core::serde_json::Value;
+use deno_core::serde_json::json;
 use deno_core::url::Url;
+use deno_resolver::collections::FolderScopedMap;
 use deno_runtime::deno_fetch;
 use deno_terminal::colors;
 use http_body_util::BodyExt;
@@ -36,15 +38,16 @@ use tokio::process::Command;
 
 use self::diagnostics::PublishDiagnostic;
 use self::diagnostics::PublishDiagnosticsCollector;
+use self::diagnostics::RelativePackageImportDiagnosticReferrer;
 use self::graph::GraphDiagnosticsCollector;
 use self::module_content::ModuleContentProvider;
 use self::paths::CollectedPublishPath;
 use self::tar::PublishableTarball;
-use crate::args::jsr_api_url;
-use crate::args::jsr_url;
 use crate::args::CliOptions;
 use crate::args::Flags;
 use crate::args::PublishFlags;
+use crate::args::jsr_api_url;
+use crate::args::jsr_url;
 use crate::factory::CliFactory;
 use crate::graph_util::ModuleGraphCreator;
 use crate::http_util::HttpClient;
@@ -65,8 +68,8 @@ mod publish_order;
 mod tar;
 mod unfurl;
 
-use auth::get_auth_method;
 use auth::AuthMethod;
+use auth::get_auth_method;
 use publish_order::PublishOrderGraph;
 use unfurl::SpecifierUnfurler;
 
@@ -102,7 +105,9 @@ pub async fn publish(
 
   if let Some(version) = &publish_flags.set_version {
     if publish_configs.len() > 1 {
-      bail!("Cannot use --set-version when publishing a workspace. Change your cwd to an individual package instead.");
+      bail!(
+        "Cannot use --set-version when publishing a workspace. Change your cwd to an individual package instead."
+      );
     }
     if let Some(publish_config) = publish_configs.get_mut(0) {
       let mut config_file = publish_config.config_file.as_ref().clone();
@@ -112,19 +117,21 @@ pub async fn publish(
   }
 
   let specifier_unfurler = SpecifierUnfurler::new(
+    Some(cli_factory.node_resolver().await?.clone()),
     cli_factory.workspace_resolver().await?.clone(),
     cli_options.unstable_bare_node_builtins(),
   );
 
   let diagnostics_collector = PublishDiagnosticsCollector::default();
+  let parsed_source_cache = cli_factory.parsed_source_cache()?;
   let module_content_provider = Arc::new(ModuleContentProvider::new(
-    cli_factory.parsed_source_cache().clone(),
+    parsed_source_cache.clone(),
     specifier_unfurler,
     cli_factory.sys(),
-    cli_factory.tsconfig_resolver()?.clone(),
+    cli_factory.compiler_options_resolver()?.clone(),
   ));
   let publish_preparer = PublishPreparer::new(
-    GraphDiagnosticsCollector::new(cli_factory.parsed_source_cache().clone()),
+    GraphDiagnosticsCollector::new(parsed_source_cache.clone()),
     cli_factory.module_graph_creator().await?.clone(),
     cli_factory.type_checker().await?.clone(),
     cli_options.clone(),
@@ -149,13 +156,13 @@ pub async fn publish(
     .ok()
     .is_none()
     && !publish_flags.allow_dirty
-  {
-    if let Some(dirty_text) =
+    && let Some(dirty_text) =
       check_if_git_repo_dirty(cli_options.initial_cwd()).await
-    {
-      log::error!("\nUncommitted changes:\n\n{}\n", dirty_text);
-      bail!("Aborting due to uncommitted changes. Check in source code or run with --allow-dirty");
-    }
+  {
+    log::error!("\nUncommitted changes:\n\n{}\n", dirty_text);
+    bail!(
+      "Aborting due to uncommitted changes. Check in source code or run with --allow-dirty"
+    );
   }
 
   if publish_flags.dry_run {
@@ -317,7 +324,9 @@ impl PublishPreparer {
         .await
         .is_some()
       {
-        bail!("When using DENO_INTERNAL_FAST_CHECK_OVERWRITE, the git repo must be in a clean state.");
+        bail!(
+          "When using DENO_INTERNAL_FAST_CHECK_OVERWRITE, the git repo must be in a clean state."
+        );
       }
 
       for module in graph.modules() {
@@ -357,18 +366,15 @@ impl PublishPreparer {
       } else {
         // fast check passed, type check the output as a temporary measure
         // until we know that it's reliable and stable
-        let mut diagnostics_by_folder = self
-          .type_checker
-          .check_diagnostics(
-            graph,
-            CheckOptions {
-              build_fast_check_graph: false, // already built
-              lib: self.cli_options.ts_type_lib_window(),
-              reload: self.cli_options.reload_flag(),
-              type_check_mode: self.cli_options.type_check_mode(),
-            },
-          )
-          .await?;
+        let mut diagnostics_by_folder = self.type_checker.check_diagnostics(
+          graph,
+          CheckOptions {
+            build_fast_check_graph: false, // already built
+            lib: self.cli_options.ts_type_lib_window(),
+            reload: self.cli_options.reload_flag(),
+            type_check_mode: self.cli_options.type_check_mode(),
+          },
+        )?;
         // ignore unused parameter diagnostics that may occur due to fast check
         // not having function body implementations
         for result in diagnostics_by_folder.by_ref() {
@@ -423,6 +429,7 @@ impl PublishPreparer {
       let config_path = config_path.clone();
       let config_url = deno_json.specifier.clone();
       let has_license_field = package.license.is_some();
+      let current_package_name = package.name.clone();
       move || {
         let root_specifier =
           ModuleSpecifier::from_directory_path(&root_dir).unwrap();
@@ -434,9 +441,18 @@ impl PublishPreparer {
             file_patterns,
             force_include_paths: vec![config_path],
           })?;
+        let all_jsr_packages = FolderScopedMap::from_map(
+          cli_options
+            .workspace()
+            .jsr_packages()
+            .map(|pkg| (pkg.member_dir.dir_url().clone(), pkg))
+            .collect(),
+        );
         collect_excluded_module_diagnostics(
           &root_specifier,
           &graph,
+          &current_package_name,
+          &all_jsr_packages,
           &publish_paths,
           &diagnostics_collector,
         );
@@ -500,7 +516,7 @@ impl PublishPreparer {
         .file_name()
         .unwrap()
         .to_string_lossy()
-        .to_string(),
+        .into_owned(),
     }))
   }
 }
@@ -685,6 +701,13 @@ async fn get_auth_headers(
   Ok(authorizations)
 }
 
+#[derive(Debug)]
+struct CreatePackageInfo {
+  scope: String,
+  package: String,
+  create_url: String,
+}
+
 /// Check if both `scope` and `package` already exist, if not return
 /// a URL to the management panel to create them.
 async fn check_if_scope_and_package_exist(
@@ -693,30 +716,22 @@ async fn check_if_scope_and_package_exist(
   registry_manage_url: &Url,
   scope: &str,
   package: &str,
-) -> Result<Option<String>, AnyError> {
-  let mut needs_scope = false;
-  let mut needs_package = false;
-
-  let response = registry::get_scope(client, registry_api_url, scope).await?;
-  if response.status() == 404 {
-    needs_scope = true;
-  }
-
+) -> Result<Option<CreatePackageInfo>, AnyError> {
   let response =
     registry::get_package(client, registry_api_url, scope, package).await?;
   if response.status() == 404 {
-    needs_package = true;
-  }
-
-  if needs_scope || needs_package {
     let create_url = format!(
       "{}new?scope={}&package={}&from=cli",
       registry_manage_url, scope, package
     );
-    return Ok(Some(create_url));
+    Ok(Some(CreatePackageInfo {
+      create_url,
+      scope: scope.to_string(),
+      package: package.to_string(),
+    }))
+  } else {
+    Ok(None)
   }
-
-  Ok(None)
 }
 
 async fn ensure_scopes_and_packages_exist(
@@ -725,23 +740,32 @@ async fn ensure_scopes_and_packages_exist(
   registry_manage_url: &Url,
   packages: &[Rc<PreparedPublishPackage>],
 ) -> Result<(), AnyError> {
+  let mut futures = FuturesUnordered::new();
+
+  for package in packages {
+    let future = check_if_scope_and_package_exist(
+      client,
+      registry_api_url,
+      registry_manage_url,
+      &package.scope,
+      &package.package,
+    );
+    futures.push(future);
+  }
+
+  let mut missing_packages = vec![];
+
+  while let Some(maybe_create_package_info) = futures.next().await {
+    if let Some(create_package_info) = maybe_create_package_info? {
+      missing_packages.push(create_package_info);
+    };
+  }
+
   if !std::io::stdin().is_terminal() {
-    let mut missing_packages_lines = vec![];
-    for package in packages {
-      let maybe_create_package_url = check_if_scope_and_package_exist(
-        client,
-        registry_api_url,
-        registry_manage_url,
-        &package.scope,
-        &package.package,
-      )
-      .await?;
-
-      if let Some(create_package_url) = maybe_create_package_url {
-        missing_packages_lines.push(format!(" - {}", create_package_url));
-      }
-    }
-
+    let missing_packages_lines: Vec<_> = missing_packages
+      .into_iter()
+      .map(|info| format!("- {}", info.create_url))
+      .collect();
     if !missing_packages_lines.is_empty() {
       bail!(
         "Following packages don't exist, follow the links and create them:\n{}",
@@ -751,41 +775,31 @@ async fn ensure_scopes_and_packages_exist(
     return Ok(());
   }
 
-  for package in packages {
-    let maybe_create_package_url = check_if_scope_and_package_exist(
-      client,
-      registry_api_url,
-      registry_manage_url,
-      &package.scope,
-      &package.package,
-    )
-    .await?;
-
-    let Some(create_package_url) = maybe_create_package_url else {
-      continue;
-    };
-
+  for create_package_info in missing_packages {
     ring_bell();
     log::warn!(
       "'@{}/{}' doesn't exist yet. Visit {} to create the package",
-      &package.scope,
-      &package.package,
-      colors::cyan_with_underline(&create_package_url)
+      &create_package_info.scope,
+      &create_package_info.package,
+      colors::cyan_with_underline(&create_package_info.create_url)
     );
     log::warn!("{}", colors::gray("Waiting..."));
-    let _ = open::that_detached(&create_package_url);
+    let _ = open::that_detached(&create_package_info.create_url);
 
     let package_api_url = registry::get_package_api_url(
       registry_api_url,
-      &package.scope,
-      &package.package,
+      &create_package_info.scope,
+      &create_package_info.package,
     );
 
     loop {
       tokio::time::sleep(std::time::Duration::from_secs(3)).await;
       let response = client.get(package_api_url.parse()?)?.send().await?;
       if response.status() == 200 {
-        let name = format!("@{}/{}", package.scope, package.package);
+        let name = format!(
+          "@{}/{}",
+          create_package_info.scope, create_package_info.package
+        );
         log::info!("Package {} created", colors::green(name));
         break;
       }
@@ -955,7 +969,7 @@ async fn publish_package(
           "Failed to publish @{}/{} at {}",
           package.scope, package.package, package.version
         )
-      })
+      });
     }
   };
 
@@ -1024,12 +1038,13 @@ async fn publish_package(
       provenance::generate_provenance(http_client, vec![subject]).await?;
 
     let tlog_entry = &bundle.verification_material.tlog_entries[0];
-    log::info!("{}",
+    log::info!(
+      "{}",
       colors::green(format!(
         "Provenance transparency log available at https://search.sigstore.dev/?logIndex={}",
         tlog_entry.log_index
       ))
-     );
+    );
 
     // Submit bundle to JSR
     let provenance_url = format!(
@@ -1062,8 +1077,10 @@ async fn publish_package(
 }
 
 fn collect_excluded_module_diagnostics(
-  root: &ModuleSpecifier,
+  root_dir: &ModuleSpecifier,
   graph: &deno_graph::ModuleGraph,
+  current_package_name: &str,
+  all_jsr_packages: &FolderScopedMap<JsrPackageConfig>,
   publish_paths: &[CollectedPublishPath],
   diagnostics_collector: &PublishDiagnosticsCollector,
 ) {
@@ -1081,12 +1098,69 @@ fn collect_excluded_module_diagnostics(
       | deno_graph::Module::Node(_)
       | deno_graph::Module::External(_) => None,
     })
-    .filter(|s| s.as_str().starts_with(root.as_str()));
+    .filter(|s| s.as_str().starts_with(root_dir.as_str()));
+  let mut outside_specifiers = Vec::new();
+  let mut had_excluded_specifier = false;
   for specifier in graph_specifiers {
     if !publish_specifiers.contains(specifier) {
-      diagnostics_collector.push(PublishDiagnostic::ExcludedModule {
-        specifier: specifier.clone(),
-      });
+      let other_jsr_pkg = all_jsr_packages
+        .get_for_specifier(specifier)
+        .filter(|pkg| pkg.member_dir.dir_url().as_ref() != root_dir);
+      match other_jsr_pkg {
+        Some(other_jsr_pkg) => {
+          outside_specifiers.push((specifier, other_jsr_pkg));
+        }
+        None => {
+          had_excluded_specifier = true;
+          diagnostics_collector.push(PublishDiagnostic::ExcludedModule {
+            specifier: specifier.clone(),
+          })
+        }
+      }
+    }
+  }
+
+  if !had_excluded_specifier {
+    // ensure no path being published references another package
+    // via a relative import
+    for publish_path in publish_paths {
+      let Some(module) = graph.get(&publish_path.specifier) else {
+        continue;
+      };
+      for (specifier_text, dep) in module.dependencies() {
+        if !deno_path_util::is_relative_specifier(specifier_text) {
+          continue;
+        }
+        let resolutions = dep
+          .maybe_code
+          .ok()
+          .into_iter()
+          .chain(dep.maybe_type.ok().into_iter());
+        let mut maybe_res = resolutions.filter_map(|r| {
+          let pkg = all_jsr_packages.get_for_specifier(&r.specifier)?;
+          if pkg.member_dir.dir_url().as_ref() != root_dir {
+            Some((r, pkg))
+          } else {
+            None
+          }
+        });
+        if let Some((outside_res, package)) = maybe_res.next() {
+          diagnostics_collector.push(
+            PublishDiagnostic::RelativePackageImport {
+              // Wasm modules won't have a referrer
+              maybe_referrer: module.source().cloned().map(|source| {
+                RelativePackageImportDiagnosticReferrer {
+                  referrer: outside_res.range.clone(),
+                  text_info: SourceTextInfo::new(source),
+                }
+              }),
+              from_package_name: current_package_name.to_string(),
+              to_package_name: package.name.clone(),
+              specifier: outside_res.specifier.clone(),
+            },
+          );
+        }
+      }
     }
   }
 }

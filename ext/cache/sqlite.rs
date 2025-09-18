@@ -8,27 +8,27 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-use deno_core::parking_lot::Mutex;
-use deno_core::unsync::spawn_blocking;
 use deno_core::BufMutView;
 use deno_core::ByteString;
 use deno_core::Resource;
-use rusqlite::params;
+use deno_core::parking_lot::Mutex;
+use deno_core::unsync::spawn_blocking;
 use rusqlite::Connection;
 use rusqlite::OptionalExtension;
+use rusqlite::params;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 
-use crate::deserialize_headers;
-use crate::get_header;
-use crate::serialize_headers;
-use crate::vary_header_matches;
 use crate::CacheDeleteRequest;
 use crate::CacheError;
 use crate::CacheMatchRequest;
 use crate::CacheMatchResponseMeta;
 use crate::CachePutRequest;
 use crate::CacheResponseResource;
+use crate::deserialize_headers;
+use crate::get_header;
+use crate::serialize_headers;
+use crate::vary_header_matches;
 
 #[derive(Clone)]
 pub struct SqliteBackedCache {
@@ -36,15 +36,37 @@ pub struct SqliteBackedCache {
   pub cache_storage_dir: PathBuf,
 }
 
+#[derive(Debug)]
+enum Mode {
+  Disk,
+  InMemory,
+}
+
 impl SqliteBackedCache {
   pub fn new(cache_storage_dir: PathBuf) -> Result<Self, CacheError> {
+    let mode = match std::env::var("DENO_CACHE_DB_MODE")
+      .unwrap_or_default()
+      .as_str()
     {
+      "disk" | "" => Mode::Disk,
+      "memory" => Mode::InMemory,
+      _ => {
+        log::warn!("Unknown DENO_CACHE_DB_MODE value, defaulting to disk");
+        Mode::Disk
+      }
+    };
+
+    let connection = if matches!(mode, Mode::InMemory) {
+      rusqlite::Connection::open_in_memory()
+        .unwrap_or_else(|_| panic!("failed to open in-memory cache db"))
+    } else {
       std::fs::create_dir_all(&cache_storage_dir).map_err(|source| {
         CacheError::CacheStorageDirectory {
           dir: cache_storage_dir.clone(),
           source,
         }
       })?;
+
       let path = cache_storage_dir.join("cache_metadata.db");
       let connection = rusqlite::Connection::open(&path).unwrap_or_else(|_| {
         panic!("failed to open cache db at {}", path.display())
@@ -57,14 +79,17 @@ impl SqliteBackedCache {
         PRAGMA optimize;
       ";
       connection.execute_batch(initial_pragmas)?;
-      connection.execute(
-        "CREATE TABLE IF NOT EXISTS cache_storage (
+      connection
+    };
+
+    connection.execute(
+      "CREATE TABLE IF NOT EXISTS cache_storage (
                     id              INTEGER PRIMARY KEY,
                     cache_name      TEXT NOT NULL UNIQUE
                 )",
-        (),
-      )?;
-      connection
+      (),
+    )?;
+    connection
         .execute(
           "CREATE TABLE IF NOT EXISTS request_response_list (
                     id                     INTEGER PRIMARY KEY,
@@ -82,11 +107,10 @@ impl SqliteBackedCache {
                 )",
           (),
         )?;
-      Ok(SqliteBackedCache {
-        connection: Arc::new(Mutex::new(connection)),
-        cache_storage_dir,
-      })
-    }
+    Ok(SqliteBackedCache {
+      connection: Arc::new(Mutex::new(connection)),
+      cache_storage_dir,
+    })
   }
 }
 
@@ -219,9 +243,11 @@ impl SqliteBackedCache {
         Some(body_key)
       );
     } else {
-      assert!(insert_cache_asset(db, request_response, None)
-        .await?
-        .is_none());
+      assert!(
+        insert_cache_asset(db, request_response, None)
+          .await?
+          .is_none()
+      );
     }
     Ok(())
   }
@@ -271,14 +297,13 @@ impl SqliteBackedCache {
         // headers of the cached request match the query request.
         if let Some(vary_header) =
           get_header("vary", &cache_meta.response_headers)
-        {
-          if !vary_header_matches(
+          && !vary_header_matches(
             &vary_header,
             &request.request_headers,
             &cache_meta.request_headers,
-          ) {
-            return Ok(None);
-          }
+          )
+        {
+          return Ok(None);
         }
         let response_path =
           get_responses_dir(cache_storage_dir, request.cache_id)
@@ -367,7 +392,7 @@ fn get_responses_dir(cache_storage_dir: PathBuf, cache_id: i64) -> PathBuf {
 }
 
 impl deno_core::Resource for SqliteBackedCache {
-  fn name(&self) -> std::borrow::Cow<str> {
+  fn name(&self) -> std::borrow::Cow<'_, str> {
     "SqliteBackedCache".into()
   }
 }

@@ -4,18 +4,19 @@ use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use deno_core::cppgc::SameObject;
-use deno_core::op2;
-use deno_core::v8;
 use deno_core::GarbageCollected;
 use deno_core::OpState;
 use deno_core::WebIDL;
+use deno_core::op2;
+use deno_core::v8;
 use tokio::sync::Mutex;
 
 use super::device::GPUDevice;
-use crate::webidl::features_to_feature_names;
-use crate::webidl::GPUFeatureName;
 use crate::Instance;
+use crate::SameObject;
+use crate::error::GPUGenericError;
+use crate::webidl::GPUFeatureName;
+use crate::webidl::features_to_feature_names;
 
 #[derive(WebIDL)]
 #[webidl(dictionary)]
@@ -60,10 +61,23 @@ impl Drop for GPUAdapter {
   }
 }
 
-impl GarbageCollected for GPUAdapter {}
+// SAFETY: we're sure this can be GCed
+unsafe impl GarbageCollected for GPUAdapter {
+  fn trace(&self, _visitor: &mut deno_core::v8::cppgc::Visitor) {}
+
+  fn get_name(&self) -> &'static std::ffi::CStr {
+    c"GPUAdapter"
+  }
+}
 
 #[op2]
 impl GPUAdapter {
+  #[constructor]
+  #[cppgc]
+  fn constructor(_: bool) -> Result<GPUAdapter, GPUGenericError> {
+    Err(GPUGenericError::InvalidConstructor)
+  }
+
   #[getter]
   #[global]
   fn info(&self, scope: &mut v8::HandleScope) -> v8::Global<v8::Object> {
@@ -244,10 +258,23 @@ pub enum CreateDeviceError {
 
 pub struct GPUSupportedLimits(pub wgpu_types::Limits);
 
-impl GarbageCollected for GPUSupportedLimits {}
+// SAFETY: we're sure this can be GCed
+unsafe impl GarbageCollected for GPUSupportedLimits {
+  fn trace(&self, _visitor: &mut deno_core::v8::cppgc::Visitor) {}
+
+  fn get_name(&self) -> &'static std::ffi::CStr {
+    c"GPUSupportedLimits"
+  }
+}
 
 #[op2]
 impl GPUSupportedLimits {
+  #[constructor]
+  #[cppgc]
+  fn constructor(_: bool) -> Result<GPUSupportedLimits, GPUGenericError> {
+    Err(GPUGenericError::InvalidConstructor)
+  }
+
   #[getter]
   fn maxTextureDimension1D(&self) -> u32 {
     self.0.max_texture_dimension_1d
@@ -401,7 +428,14 @@ impl GPUSupportedLimits {
 
 pub struct GPUSupportedFeatures(v8::Global<v8::Value>);
 
-impl GarbageCollected for GPUSupportedFeatures {}
+// SAFETY: we're sure this can be GCed
+unsafe impl GarbageCollected for GPUSupportedFeatures {
+  fn trace(&self, _visitor: &mut deno_core::v8::cppgc::Visitor) {}
+
+  fn get_name(&self) -> &'static std::ffi::CStr {
+    c"GPUSupportedFeatures"
+  }
+}
 
 impl GPUSupportedFeatures {
   pub fn new(
@@ -421,6 +455,12 @@ impl GPUSupportedFeatures {
 
 #[op2]
 impl GPUSupportedFeatures {
+  #[constructor]
+  #[cppgc]
+  fn constructor(_: bool) -> Result<GPUSupportedFeatures, GPUGenericError> {
+    Err(GPUGenericError::InvalidConstructor)
+  }
+
   #[global]
   #[symbol("setlike_set")]
   fn set(&self) -> v8::Global<v8::Value> {
@@ -434,10 +474,23 @@ pub struct GPUAdapterInfo {
   pub subgroup_max_size: u32,
 }
 
-impl GarbageCollected for GPUAdapterInfo {}
+// SAFETY: we're sure this can be GCed
+unsafe impl GarbageCollected for GPUAdapterInfo {
+  fn trace(&self, _visitor: &mut deno_core::v8::cppgc::Visitor) {}
+
+  fn get_name(&self) -> &'static std::ffi::CStr {
+    c"GPUAdapterInfo"
+  }
+}
 
 #[op2]
 impl GPUAdapterInfo {
+  #[constructor]
+  #[cppgc]
+  fn constructor(_: bool) -> Result<GPUAdapterInfo, GPUGenericError> {
+    Err(GPUGenericError::InvalidConstructor)
+  }
+
   #[getter]
   #[string]
   fn vendor(&self) -> String {

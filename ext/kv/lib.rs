@@ -10,17 +10,14 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::num::NonZeroU32;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
-use base64::prelude::BASE64_URL_SAFE;
 use base64::Engine;
+use base64::prelude::BASE64_URL_SAFE;
 use boxed_error::Boxed;
 use chrono::DateTime;
 use chrono::Utc;
-use deno_core::futures::StreamExt;
-use deno_core::op2;
-use deno_core::serde_v8::AnyValue;
-use deno_core::serde_v8::BigInt;
 use deno_core::AsyncRefCell;
 use deno_core::ByteString;
 use deno_core::CancelFuture;
@@ -31,10 +28,13 @@ use deno_core::RcRef;
 use deno_core::Resource;
 use deno_core::ResourceId;
 use deno_core::ToJsBuffer;
+use deno_core::futures::StreamExt;
+use deno_core::op2;
+use deno_core::serde_v8::AnyValue;
+use deno_core::serde_v8::BigInt;
 use deno_error::JsErrorBox;
 use deno_error::JsErrorClass;
-use denokv_proto::decode_key;
-use denokv_proto::encode_key;
+use deno_features::FeatureChecker;
 use denokv_proto::AtomicWrite;
 use denokv_proto::Check;
 use denokv_proto::Consistency;
@@ -51,6 +51,8 @@ use denokv_proto::ReadRange;
 use denokv_proto::SnapshotReadOptions;
 use denokv_proto::WatchKeyOutput;
 use denokv_proto::WatchStream;
+use denokv_proto::decode_key;
+use denokv_proto::encode_key;
 use log::debug;
 use serde::Deserialize;
 use serde::Serialize;
@@ -90,7 +92,7 @@ struct DatabaseResource<DB: Database + 'static> {
 }
 
 impl<DB: Database + 'static> Resource for DatabaseResource<DB> {
-  fn name(&self) -> Cow<str> {
+  fn name(&self) -> Cow<'_, str> {
     "database".into()
   }
 
@@ -107,7 +109,7 @@ struct DatabaseWatcherResource {
 }
 
 impl Resource for DatabaseWatcherResource {
-  fn name(&self) -> Cow<str> {
+  fn name(&self) -> Cow<'_, str> {
     "databaseWatcher".into()
   }
 
@@ -219,7 +221,7 @@ where
   let handler = {
     let state = state.borrow();
     state
-      .feature_checker
+      .borrow::<Arc<FeatureChecker>>()
       .check_or_exit(UNSTABLE_FEATURE_NAME, "Deno.openKv");
     state.borrow::<Rc<DBH>>().clone()
   };
@@ -427,7 +429,7 @@ struct QueueMessageResource<QPH: QueueMessageHandle + 'static> {
 }
 
 impl<QMH: QueueMessageHandle + 'static> Resource for QueueMessageResource<QMH> {
-  fn name(&self) -> Cow<str> {
+  fn name(&self) -> Cow<'_, str> {
     "queueMessage".into()
   }
 }
@@ -669,10 +671,10 @@ fn mutation_from_v8(
       MutationKind::SetSuffixVersionstampedKey(value.try_into()?)
     }
     (op, Some(_)) => {
-      return Err(KvMutationError::InvalidMutationWithValue(op.to_string()))
+      return Err(KvMutationError::InvalidMutationWithValue(op.to_string()));
     }
     (op, None) => {
-      return Err(KvMutationError::InvalidMutationWithoutValue(op.to_string()))
+      return Err(KvMutationError::InvalidMutationWithoutValue(op.to_string()));
     }
   };
   Ok(Mutation {
@@ -867,16 +869,16 @@ fn decode_selector_and_cursor(
   }
 
   // Defend against out-of-bounds reading
-  if let Some(start) = selector.start() {
-    if &first_key[..] < start {
-      return Err(KvErrorKind::CursorOutOfBounds.into_box());
-    }
+  if let Some(start) = selector.start()
+    && &first_key[..] < start
+  {
+    return Err(KvErrorKind::CursorOutOfBounds.into_box());
   }
 
-  if let Some(end) = selector.end() {
-    if &last_key[..] > end {
-      return Err(KvErrorKind::CursorOutOfBounds.into_box());
-    }
+  if let Some(end) = selector.end()
+    && &last_key[..] > end
+  {
+    return Err(KvErrorKind::CursorOutOfBounds.into_box());
   }
 
   Ok((first_key, last_key))

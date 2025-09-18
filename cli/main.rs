@@ -3,7 +3,6 @@
 mod args;
 mod cache;
 mod cdp;
-mod emit;
 mod factory;
 mod file_fetcher;
 mod graph_container;
@@ -30,9 +29,11 @@ pub mod sys {
   pub type CliSys = sys_traits::impls::RealSys;
 }
 
+use std::collections::HashMap;
 use std::env;
 use std::future::Future;
 use std::io::IsTerminal;
+use std::io::Write as _;
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -40,16 +41,17 @@ use std::sync::Arc;
 use args::TaskFlags;
 use deno_core::anyhow::Context;
 use deno_core::error::AnyError;
-use deno_core::error::CoreError;
 use deno_core::futures::FutureExt;
 use deno_core::unsync::JoinHandle;
 use deno_lib::util::result::any_and_jserrorbox_downcast_ref;
+use deno_lib::util::result::js_error_downcast_ref;
+use deno_lib::worker::LibWorkerFactoryRoots;
 use deno_resolver::npm::ByonmResolvePkgFolderFromDenoReqError;
 use deno_resolver::npm::ResolvePkgFolderFromDenoReqError;
+use deno_runtime::UnconfiguredRuntime;
+use deno_runtime::WorkerExecutionMode;
 use deno_runtime::fmt_errors::format_js_error;
 use deno_runtime::tokio_util::create_and_run_current_thread_with_maybe_metrics;
-use deno_runtime::WorkerExecutionMode;
-pub use deno_runtime::UNSTABLE_GRANULAR_FLAGS;
 use deno_telemetry::OtelConfig;
 use deno_terminal::colors;
 use factory::CliFactory;
@@ -57,14 +59,16 @@ use factory::CliFactory;
 const MODULE_NOT_FOUND: &str = "Module not found";
 const UNSUPPORTED_SCHEME: &str = "Unsupported scheme";
 
-use self::npm::ResolveSnapshotError;
 use self::util::draw_thread::DrawThread;
-use crate::args::flags_from_vec;
 use crate::args::DenoSubcommand;
 use crate::args::Flags;
+use crate::args::flags_from_vec;
+use crate::args::get_default_v8_flags;
 use crate::util::display;
 use crate::util::v8::get_v8_flags_from_env;
 use crate::util::v8::init_v8_flags;
+use crate::util::watch_env_tracker::WatchEnvTracker;
+use crate::util::watch_env_tracker::load_env_variables_from_env_files;
 
 #[cfg(feature = "dhat-heap")]
 #[global_allocator]
@@ -106,22 +110,37 @@ fn spawn_subcommand<F: Future<Output = T> + 'static, T: SubcommandOutput>(
   )
 }
 
-async fn run_subcommand(flags: Arc<Flags>) -> Result<i32, AnyError> {
+async fn run_subcommand(
+  flags: Arc<Flags>,
+  unconfigured_runtime: Option<UnconfiguredRuntime>,
+  roots: LibWorkerFactoryRoots,
+) -> Result<i32, AnyError> {
   let handle = match flags.subcommand.clone() {
     DenoSubcommand::Add(add_flags) => spawn_subcommand(async {
       tools::pm::add(flags, add_flags, tools::pm::AddCommandName::Add).await
     }),
-    DenoSubcommand::Remove(remove_flags) => spawn_subcommand(async {
-      tools::pm::remove(flags, remove_flags).await
-    }),
+    DenoSubcommand::Remove(remove_flags) => {
+      spawn_subcommand(async { tools::pm::remove(flags, remove_flags).await })
+    }
     DenoSubcommand::Bench(bench_flags) => spawn_subcommand(async {
       if bench_flags.watch.is_some() {
-        tools::bench::run_benchmarks_with_watch(flags, bench_flags).boxed_local().await
+        tools::bench::run_benchmarks_with_watch(flags, bench_flags)
+          .boxed_local()
+          .await
       } else {
         tools::bench::run_benchmarks(flags, bench_flags).await
       }
     }),
-    DenoSubcommand::Bundle => exit_with_message("⚠️ `deno bundle` was removed in Deno 2.\n\nSee the Deno 1.x to 2.x Migration Guide for migration instructions: https://docs.deno.com/runtime/manual/advanced/migrate_deprecations", 1),
+    DenoSubcommand::Bundle(bundle_flags) => spawn_subcommand(async {
+      log::warn!(
+        "⚠️  {} is experimental and subject to changes",
+        colors::cyan("deno bundle")
+      );
+      tools::bundle::bundle(flags, bundle_flags).await
+    }),
+    DenoSubcommand::Deploy => spawn_subcommand(async {
+      tools::deploy::deploy(Arc::unwrap_or_clone(flags)).await
+    }),
     DenoSubcommand::Doc(doc_flags) => {
       spawn_subcommand(async { tools::doc::doc(flags, doc_flags).await })
     }
@@ -129,23 +148,31 @@ async fn run_subcommand(flags: Arc<Flags>) -> Result<i32, AnyError> {
       tools::run::eval_command(flags, eval_flags).await
     }),
     DenoSubcommand::Cache(cache_flags) => spawn_subcommand(async move {
-      tools::installer::install_from_entrypoints(flags, &cache_flags.files).await
+      tools::installer::install_from_entrypoints(flags, &cache_flags.files)
+        .await
     }),
-    DenoSubcommand::Check(check_flags) => spawn_subcommand(async move {
-      tools::check::check(flags, check_flags).await
-    }),
-    DenoSubcommand::Clean => spawn_subcommand(async move {
-      tools::clean::clean(flags)
-    }),
+    DenoSubcommand::Check(check_flags) => {
+      spawn_subcommand(
+        async move { tools::check::check(flags, check_flags).await },
+      )
+    }
+    DenoSubcommand::Clean(clean_flags) => {
+      spawn_subcommand(
+        async move { tools::clean::clean(flags, clean_flags).await },
+      )
+    }
     DenoSubcommand::Compile(compile_flags) => spawn_subcommand(async {
       if compile_flags.eszip {
-        tools::compile::compile_eszip(flags, compile_flags).boxed_local().await
+        tools::compile::compile_eszip(flags, compile_flags)
+          .boxed_local()
+          .await
       } else {
         tools::compile::compile(flags, compile_flags).await
       }
     }),
     DenoSubcommand::Coverage(coverage_flags) => spawn_subcommand(async move {
-      let reporter = crate::tools::coverage::reporter::create(coverage_flags.r#type.clone());
+      let reporter =
+        crate::tools::coverage::reporter::create(coverage_flags.r#type.clone());
       tools::coverage::cover_files(
         flags,
         coverage_flags.files.include,
@@ -153,7 +180,7 @@ async fn run_subcommand(flags: Arc<Flags>) -> Result<i32, AnyError> {
         coverage_flags.include,
         coverage_flags.exclude,
         coverage_flags.output,
-        &[&*reporter]
+        &[&*reporter],
       )
     }),
     DenoSubcommand::Fmt(fmt_flags) => {
@@ -162,9 +189,7 @@ async fn run_subcommand(flags: Arc<Flags>) -> Result<i32, AnyError> {
       )
     }
     DenoSubcommand::Init(init_flags) => {
-      spawn_subcommand(async {
-        tools::init::init_project(init_flags).await
-      })
+      spawn_subcommand(async { tools::init::init_project(init_flags).await })
     }
     DenoSubcommand::Info(info_flags) => {
       spawn_subcommand(async { tools::info::info(flags, info_flags).await })
@@ -172,9 +197,13 @@ async fn run_subcommand(flags: Arc<Flags>) -> Result<i32, AnyError> {
     DenoSubcommand::Install(install_flags) => spawn_subcommand(async {
       tools::installer::install_command(flags, install_flags).await
     }),
-    DenoSubcommand::JSONReference(json_reference) => spawn_subcommand(async move {
-      display::write_to_stdout_ignore_sigpipe(&deno_core::serde_json::to_vec_pretty(&json_reference.json).unwrap())
-    }),
+    DenoSubcommand::JSONReference(json_reference) => {
+      spawn_subcommand(async move {
+        display::write_to_stdout_ignore_sigpipe(
+          &deno_core::serde_json::to_vec_pretty(&json_reference.json).unwrap(),
+        )
+      })
+    }
     DenoSubcommand::Jupyter(jupyter_flags) => spawn_subcommand(async {
       tools::jupyter::kernel(flags, jupyter_flags).await
     }),
@@ -192,8 +221,7 @@ async fn run_subcommand(flags: Arc<Flags>) -> Result<i32, AnyError> {
   Press Ctrl+C to exit.
         ", colors::cyan("deno lsp"));
       }
-      let factory = CliFactory::from_flags(flags.clone());
-      lsp::start(Arc::new(factory.lockfile_npm_package_info_provider()?)).await
+      lsp::start().await
     }),
     DenoSubcommand::Lint(lint_flags) => spawn_subcommand(async {
       if lint_flags.rules {
@@ -207,48 +235,105 @@ async fn run_subcommand(flags: Arc<Flags>) -> Result<i32, AnyError> {
       }
     }),
     DenoSubcommand::Outdated(update_flags) => {
-      spawn_subcommand(async move {
-        tools::pm::outdated(flags, update_flags).await
-      })
+      spawn_subcommand(
+        async move { tools::pm::outdated(flags, update_flags).await },
+      )
     }
     DenoSubcommand::Repl(repl_flags) => {
       spawn_subcommand(async move { tools::repl::run(flags, repl_flags).await })
     }
     DenoSubcommand::Run(run_flags) => spawn_subcommand(async move {
-      if run_flags.is_stdin() {
+      if run_flags.print_task_list {
+        let task_flags = TaskFlags {
+          cwd: None,
+          task: None,
+          is_run: true,
+          recursive: false,
+          filter: None,
+          eval: false,
+        };
+        let mut flags = flags.deref().clone();
+        flags.subcommand = DenoSubcommand::Task(task_flags.clone());
+        writeln!(
+          &mut std::io::stdout(),
+          "Please specify a {} or a {}.\n",
+          colors::bold("[SCRIPT_ARG]"),
+          colors::bold("task name")
+        )?;
+        std::io::stdout().flush()?;
+        tools::task::execute_script(Arc::new(flags), task_flags)
+          .await
+          .map(|_| 1)
+      } else if run_flags.is_stdin() {
         // these futures are boxed to prevent stack overflows on Windows
-        tools::run::run_from_stdin(flags.clone()).boxed_local().await
+        tools::run::run_from_stdin(flags.clone(), unconfigured_runtime, roots)
+          .boxed_local()
+          .await
       } else if flags.eszip {
-        tools::run::run_eszip(flags, run_flags).boxed_local().await
+        tools::run::run_eszip(flags, run_flags, unconfigured_runtime, roots)
+          .boxed_local()
+          .await
       } else {
-        let result = tools::run::run_script(WorkerExecutionMode::Run, flags.clone(), run_flags.watch).await;
+        let result = tools::run::run_script(
+          WorkerExecutionMode::Run,
+          flags.clone(),
+          run_flags.watch,
+          unconfigured_runtime,
+          roots.clone(),
+        )
+        .await;
         match result {
           Ok(v) => Ok(v),
           Err(script_err) => {
-            if let Some(worker::CreateCustomWorkerError::ResolvePkgFolderFromDenoReq(ResolvePkgFolderFromDenoReqError::Byonm(ByonmResolvePkgFolderFromDenoReqError::UnmatchedReq(_)))) = any_and_jserrorbox_downcast_ref::<worker::CreateCustomWorkerError>(&script_err) {
-              if flags.node_modules_dir.is_none() {
-                let mut flags = flags.deref().clone();
-                let watch = match &flags.subcommand {
-                  DenoSubcommand::Run(run_flags) => run_flags.watch.clone(),
-                  _ => unreachable!(),
-                };
-                flags.node_modules_dir = Some(deno_config::deno_json::NodeModulesDirMode::None);
-                // use the current lockfile, but don't write it out
-                if flags.frozen_lockfile.is_none() {
-                  flags.internal.lockfile_skip_write = true;
-                }
-                return tools::run::run_script(WorkerExecutionMode::Run, Arc::new(flags), watch).boxed_local().await;
+            if let Some(
+              worker::CreateCustomWorkerError::ResolvePkgFolderFromDenoReq(
+                ResolvePkgFolderFromDenoReqError::Byonm(
+                  ByonmResolvePkgFolderFromDenoReqError::UnmatchedReq(_),
+                ),
+              ),
+            ) = any_and_jserrorbox_downcast_ref::<
+              worker::CreateCustomWorkerError,
+            >(&script_err)
+              && flags.node_modules_dir.is_none()
+            {
+              let mut flags = flags.deref().clone();
+              let watch = match &flags.subcommand {
+                DenoSubcommand::Run(run_flags) => run_flags.watch.clone(),
+                _ => unreachable!(),
+              };
+              flags.node_modules_dir =
+                Some(deno_config::deno_json::NodeModulesDirMode::None);
+              // use the current lockfile, but don't write it out
+              if flags.frozen_lockfile.is_none() {
+                flags.internal.lockfile_skip_write = true;
               }
+              return tools::run::run_script(
+                WorkerExecutionMode::Run,
+                Arc::new(flags),
+                watch,
+                None,
+                roots,
+              )
+              .boxed_local()
+              .await;
             }
             let script_err_msg = script_err.to_string();
-            if script_err_msg.starts_with(MODULE_NOT_FOUND) || script_err_msg.starts_with(UNSUPPORTED_SCHEME) {
+            if should_fallback_on_run_error(script_err_msg.as_str()) {
               if run_flags.bare {
                 let mut cmd = args::clap_root();
                 cmd.build();
-                let command_names = cmd.get_subcommands().map(|command| command.get_name()).collect::<Vec<_>>();
-                let suggestions = args::did_you_mean(&run_flags.script, command_names);
-                if !suggestions.is_empty() {
-                  let mut error = clap::error::Error::<clap::error::DefaultFormatter>::new(clap::error::ErrorKind::InvalidSubcommand).with_cmd(&cmd);
+                let command_names = cmd
+                  .get_subcommands()
+                  .map(|command| command.get_name())
+                  .collect::<Vec<_>>();
+                let suggestions =
+                  args::did_you_mean(&run_flags.script, command_names);
+                if !suggestions.is_empty() && !run_flags.script.contains('.') {
+                  let mut error =
+                    clap::error::Error::<clap::error::DefaultFormatter>::new(
+                      clap::error::ErrorKind::InvalidSubcommand,
+                    )
+                    .with_cmd(&cmd);
                   error.insert(
                     clap::error::ContextKind::SuggestedSubcommand,
                     clap::error::ContextValue::Strings(suggestions),
@@ -269,7 +354,11 @@ async fn run_subcommand(flags: Arc<Flags>) -> Result<i32, AnyError> {
                   eval: false,
                 };
                 new_flags.subcommand = DenoSubcommand::Task(task_flags.clone());
-                let result = tools::task::execute_script(Arc::new(new_flags), task_flags.clone()).await;
+                let result = tools::task::execute_script(
+                  Arc::new(new_flags),
+                  task_flags.clone(),
+                )
+                .await;
                 match result {
                   Ok(v) => Ok(v),
                   Err(_) => {
@@ -286,7 +375,7 @@ async fn run_subcommand(flags: Arc<Flags>) -> Result<i32, AnyError> {
       }
     }),
     DenoSubcommand::Serve(serve_flags) => spawn_subcommand(async move {
-      tools::serve::serve(flags, serve_flags).await
+      tools::serve::serve(flags, serve_flags, unconfigured_runtime, roots).await
     }),
     DenoSubcommand::Task(task_flags) => spawn_subcommand(async {
       tools::task::execute_script(flags, task_flags).await
@@ -302,10 +391,14 @@ async fn run_subcommand(flags: Arc<Flags>) -> Result<i32, AnyError> {
             .with_context(|| format!("Failed creating: {coverage_dir}"))?;
           // this is set in order to ensure spawned processes use the same
           // coverage directory
-          env::set_var(
-            "DENO_UNSTABLE_COVERAGE_DIR",
-            PathBuf::from(coverage_dir).canonicalize()?,
-          );
+
+          #[allow(clippy::undocumented_unsafe_blocks)]
+          unsafe {
+            env::set_var(
+              "DENO_COVERAGE_DIR",
+              PathBuf::from(coverage_dir).canonicalize()?,
+            )
+          };
         }
 
         if test_flags.watch.is_some() {
@@ -333,18 +426,24 @@ async fn run_subcommand(flags: Arc<Flags>) -> Result<i32, AnyError> {
       "This deno was built without the \"upgrade\" feature. Please upgrade using the installation method originally used to install Deno.",
       1,
     ),
-    DenoSubcommand::Vendor => exit_with_message("⚠️ `deno vendor` was removed in Deno 2.\n\nSee the Deno 1.x to 2.x Migration Guide for migration instructions: https://docs.deno.com/runtime/manual/advanced/migrate_deprecations", 1),
+    DenoSubcommand::Vendor => exit_with_message(
+      "⚠️  `deno vendor` was removed in Deno 2.\n\nSee the Deno 1.x to 2.x Migration Guide for migration instructions: https://docs.deno.com/runtime/manual/advanced/migrate_deprecations",
+      1,
+    ),
     DenoSubcommand::Publish(publish_flags) => spawn_subcommand(async {
       tools::publish::publish(flags, publish_flags).await
     }),
     DenoSubcommand::Help(help_flags) => spawn_subcommand(async move {
       use std::io::Write;
 
-      let mut stream = anstream::AutoStream::new(std::io::stdout(), if colors::use_color() {
-        anstream::ColorChoice::Auto
-      } else {
-        anstream::ColorChoice::Never
-      });
+      let mut stream = anstream::AutoStream::new(
+        std::io::stdout(),
+        if colors::use_color() {
+          anstream::ColorChoice::Auto
+        } else {
+          anstream::ColorChoice::Never
+        },
+      );
 
       match stream.write_all(help_flags.help.ansi().to_string().as_bytes()) {
         Ok(()) => Ok(()),
@@ -357,6 +456,29 @@ async fn run_subcommand(flags: Arc<Flags>) -> Result<i32, AnyError> {
   };
 
   handle.await?
+}
+
+/// Determines whether a error encountered during `deno run`
+/// should trigger fallback behavior, such as attempting to run a Deno task
+/// with the same name.
+///
+/// Checks if the error message indicates a "module not found",
+/// "unsupported scheme", or certain OS-level import failures (such as
+/// "Is a directory" or "Access is denied"); if so, Deno will attempt to
+/// interpret the original argument as a script name or task instead of a
+/// file path.
+///
+/// See: https://github.com/denoland/deno/issues/28878
+fn should_fallback_on_run_error(script_err: &str) -> bool {
+  if script_err.starts_with(MODULE_NOT_FOUND)
+    || script_err.starts_with(UNSUPPORTED_SCHEME)
+  {
+    return true;
+  }
+  let re = lazy_regex::regex!(
+    r"Import 'file:///.+?' failed\.\n\s+0: .+ \(os error \d+\)"
+  );
+  re.is_match(script_err)
 }
 
 #[allow(clippy::print_stderr)]
@@ -404,6 +526,14 @@ fn setup_panic_hook() {
     orig_hook(panic_info);
     deno_runtime::exit(1);
   }));
+
+  fn error_handler(file: &str, line: i32, message: &str) {
+    // Override C++ abort with a rust panic, so we
+    // get our message above and a nice backtrace.
+    panic!("Fatal error in {file}:{line}: {message}");
+  }
+
+  deno_core::v8::V8::set_fatal_error_handler(error_handler);
 }
 
 fn exit_with_message(message: &str, code: i32) -> ! {
@@ -416,23 +546,12 @@ fn exit_with_message(message: &str, code: i32) -> ! {
 }
 
 fn exit_for_error(error: AnyError) -> ! {
-  let mut error_string = format!("{error:?}");
-  let mut error_code = 1;
+  let error_string = match js_error_downcast_ref(&error) {
+    Some(e) => format_js_error(e),
+    None => format!("{error:?}"),
+  };
 
-  if let Some(CoreError::Js(e)) =
-    any_and_jserrorbox_downcast_ref::<CoreError>(&error)
-  {
-    error_string = format_js_error(e);
-  } else if let Some(e @ ResolveSnapshotError { .. }) =
-    any_and_jserrorbox_downcast_ref::<ResolveSnapshotError>(&error)
-  {
-    if let Some(e) = e.maybe_integrity_check_error() {
-      error_string = e.to_string();
-      error_code = 10;
-    }
-  }
-
-  exit_with_message(&error_string, error_code);
+  exit_with_message(&error_string, 1);
 }
 
 pub(crate) fn unstable_exit_cb(feature: &str, api_name: &str) {
@@ -449,22 +568,58 @@ pub fn main() {
 
   setup_panic_hook();
 
+  init_logging(None, None);
+
   util::unix::raise_fd_limit();
   util::windows::ensure_stdio_open();
   #[cfg(windows)]
-  colors::enable_ansi(); // For Windows 10
+  {
+    deno_subprocess_windows::disable_stdio_inheritance();
+    colors::enable_ansi(); // For Windows 10
+  }
   deno_runtime::deno_permissions::set_prompt_callbacks(
     Box::new(util::draw_thread::DrawThread::hide),
     Box::new(util::draw_thread::DrawThread::show),
   );
 
+  rustls::crypto::aws_lc_rs::default_provider()
+    .install_default()
+    .unwrap();
+
   let args: Vec<_> = env::args_os().collect();
   let future = async move {
+    let roots = LibWorkerFactoryRoots::default();
+
+    #[cfg(unix)]
+    let (waited_unconfigured_runtime, waited_args) =
+      match wait_for_start(&args, roots.clone()) {
+        Some(f) => match f.await {
+          Ok(v) => match v {
+            Some((u, a)) => (Some(u), Some(a)),
+            None => (None, None),
+          },
+          Err(e) => {
+            panic!("Failure from control sock: {e}");
+          }
+        },
+        None => (None, None),
+      };
+
+    #[cfg(not(unix))]
+    let (waited_unconfigured_runtime, waited_args) = (None, None);
+
+    let args = waited_args.unwrap_or(args);
+
     // NOTE(lucacasonato): due to new PKU feature introduced in V8 11.6 we need to
     // initialize the V8 platform on a parent thread of all threads that will spawn
     // V8 isolates.
-    let flags = resolve_flags_and_init(args)?;
-    run_subcommand(Arc::new(flags)).await
+    let flags = resolve_flags_and_init(args).await?;
+
+    if waited_unconfigured_runtime.is_none() {
+      init_v8(&flags);
+    }
+
+    run_subcommand(Arc::new(flags), waited_unconfigured_runtime, roots).await
   };
 
   let result = create_and_run_current_thread_with_maybe_metrics(future);
@@ -478,42 +633,93 @@ pub fn main() {
   }
 }
 
-fn resolve_flags_and_init(
+async fn resolve_flags_and_init(
   args: Vec<std::ffi::OsString>,
 ) -> Result<Flags, AnyError> {
-  let flags = match flags_from_vec(args) {
+  let mut flags = match flags_from_vec(args) {
     Ok(flags) => flags,
     Err(err @ clap::Error { .. })
       if err.kind() == clap::error::ErrorKind::DisplayVersion =>
     {
       // Ignore results to avoid BrokenPipe errors.
-      init_logging(None, None);
       let _ = err.print();
       deno_runtime::exit(0);
     }
-    Err(err) => {
-      init_logging(None, None);
-      exit_for_error(AnyError::from(err))
-    }
+    Err(err) => exit_for_error(AnyError::from(err)),
   };
+  // preserve already loaded env variables
+  if flags.subcommand.watch_flags().is_some() {
+    WatchEnvTracker::snapshot();
+  }
+  let env_file_paths: Option<Vec<std::path::PathBuf>> = flags
+    .env_file
+    .as_ref()
+    .map(|files| files.iter().map(PathBuf::from).collect());
+  load_env_variables_from_env_files(env_file_paths.as_ref(), flags.log_level);
+  flags.unstable_config.fill_with_env();
+  if std::env::var("DENO_COMPAT").is_ok() {
+    flags.unstable_config.enable_node_compat();
+  }
+  if flags.node_conditions.is_empty()
+    && let Ok(conditions) = std::env::var("DENO_CONDITIONS")
+  {
+    flags.node_conditions = conditions
+      .split(",")
+      .map(|c| c.trim().to_string())
+      .collect();
+  }
+
+  // Tunnel is initialized before OTEL since
+  // OTEL data is submitted via the tunnel.
+  if let Some(host) = flags
+    .connected
+    .clone()
+    .or_else(|| env::var("DENO_CONNECTED").ok())
+  {
+    if let Err(err) = initialize_tunnel(&host, &flags).await {
+      exit_for_error(err.context("Failed to start with --connected"));
+    }
+    // SAFETY: We're doing this before any threads are created.
+    unsafe {
+      std::env::set_var("DENO_CONNECTED", &host);
+    }
+  }
 
   let otel_config = flags.otel_config();
+  init_logging(flags.log_level, Some(otel_config.clone()));
   deno_telemetry::init(
     deno_lib::version::otel_runtime_config(),
     otel_config.clone(),
   )?;
-  init_logging(flags.log_level, Some(otel_config));
+
+  if flags.permission_set.is_some() {
+    log::warn!(
+      "{} Permissions in the config file is an experimental feature and may change in the future.",
+      colors::yellow("Warning")
+    );
+  }
 
   // TODO(bartlomieju): remove in Deno v2.5 and hard error then.
   if flags.unstable_config.legacy_flag_enabled {
     log::warn!(
-      "⚠️  {}",
-      colors::yellow(
-        "The `--unstable` flag has been removed in Deno 2.0. Use granular `--unstable-*` flags instead.\nLearn more at: https://docs.deno.com/runtime/manual/tools/unstable_flags"
-      )
+      "{} The `--unstable` flag has been removed in Deno 2.0. Use granular `--unstable-*` flags instead.\nLearn more at: https://docs.deno.com/runtime/manual/tools/unstable_flags",
+      colors::yellow("Warning")
     );
   }
 
+  if let Ok(audit_path) = std::env::var("DENO_AUDIT_PERMISSIONS") {
+    let audit_file = deno_runtime::deno_permissions::AUDIT_FILE.set(
+      deno_core::parking_lot::Mutex::new(std::fs::File::create(audit_path)?),
+    );
+    if audit_file.is_err() {
+      log::warn!("⚠️  {}", colors::yellow("Audit file is already set"));
+    }
+  }
+
+  Ok(flags)
+}
+
+fn init_v8(flags: &Flags) {
   let default_v8_flags = match flags.subcommand {
     DenoSubcommand::Lsp => vec![
       "--stack-size=1024".to_string(),
@@ -522,26 +728,26 @@ fn resolve_flags_and_init(
       // https://github.com/microsoft/vscode/blob/48d4ba271686e8072fc6674137415bc80d936bc7/extensions/typescript-language-features/src/configuration/configuration.ts#L213-L214
       "--max-old-space-size=3072".to_string(),
     ],
-    _ => {
-      vec![
-        "--stack-size=1024".to_string(),
-        "--js-explicit-resource-management".to_string(),
-        // TODO(bartlomieju): I think this can be removed as it's handled by `deno_core`
-        // and its settings.
-        // deno_ast removes TypeScript `assert` keywords, so this flag only affects JavaScript
-        // TODO(petamoriken): Need to check TypeScript `assert` keywords in deno_ast
-        "--no-harmony-import-assertions".to_string(),
-      ]
-    }
+    _ => get_default_v8_flags(),
   };
 
-  init_v8_flags(&default_v8_flags, &flags.v8_flags, get_v8_flags_from_env());
+  let env_v8_flags = get_v8_flags_from_env();
+  let is_single_threaded = env_v8_flags
+    .iter()
+    .chain(&flags.v8_flags)
+    .any(|flag| flag == "--single-threaded");
+  init_v8_flags(&default_v8_flags, &flags.v8_flags, env_v8_flags);
+  let v8_platform = if is_single_threaded {
+    Some(::deno_core::v8::Platform::new_single_threaded(true).make_shared())
+  } else {
+    None
+  };
+
   // TODO(bartlomieju): remove last argument once Deploy no longer needs it
   deno_core::JsRuntime::init_platform(
-    None, /* import assertions enabled */ false,
+    v8_platform,
+    /* import assertions enabled */ false,
   );
-
-  Ok(flags)
 }
 
 fn init_logging(
@@ -558,4 +764,322 @@ fn init_logging(
     on_log_start: DrawThread::hide,
     on_log_end: DrawThread::show,
   })
+}
+
+#[cfg(unix)]
+#[allow(clippy::type_complexity)]
+fn wait_for_start(
+  args: &[std::ffi::OsString],
+  roots: LibWorkerFactoryRoots,
+) -> Option<
+  impl Future<
+    Output = Result<
+      Option<(UnconfiguredRuntime, Vec<std::ffi::OsString>)>,
+      AnyError,
+    >,
+  > + use<>,
+> {
+  let startup_snapshot = deno_snapshots::CLI_SNAPSHOT?;
+  let addr = std::env::var("DENO_UNSTABLE_CONTROL_SOCK").ok()?;
+
+  #[allow(clippy::undocumented_unsafe_blocks)]
+  unsafe {
+    std::env::remove_var("DENO_UNSTABLE_CONTROL_SOCK")
+  };
+
+  let argv0 = args[0].clone();
+
+  Some(async move {
+    use tokio::io::AsyncBufReadExt;
+    use tokio::io::AsyncRead;
+    use tokio::io::AsyncWrite;
+    use tokio::io::AsyncWriteExt;
+    use tokio::io::BufReader;
+    use tokio::net::TcpListener;
+    use tokio::net::UnixSocket;
+    #[cfg(any(
+      target_os = "android",
+      target_os = "linux",
+      target_os = "macos"
+    ))]
+    use tokio_vsock::VsockAddr;
+    #[cfg(any(
+      target_os = "android",
+      target_os = "linux",
+      target_os = "macos"
+    ))]
+    use tokio_vsock::VsockListener;
+
+    init_v8(&Flags::default());
+
+    let unconfigured = deno_runtime::UnconfiguredRuntime::new::<
+      deno_resolver::npm::DenoInNpmPackageChecker,
+      crate::npm::CliNpmResolver,
+      crate::sys::CliSys,
+    >(deno_runtime::UnconfiguredRuntimeOptions {
+      startup_snapshot,
+      create_params: deno_lib::worker::create_isolate_create_params(
+        &crate::sys::CliSys::default(),
+      ),
+      shared_array_buffer_store: Some(roots.shared_array_buffer_store.clone()),
+      compiled_wasm_module_store: Some(
+        roots.compiled_wasm_module_store.clone(),
+      ),
+      additional_extensions: vec![],
+    });
+
+    let (rx, mut tx): (
+      Box<dyn AsyncRead + Unpin>,
+      Box<dyn AsyncWrite + Send + Unpin>,
+    ) = match addr.split_once(':') {
+      Some(("tcp", addr)) => {
+        let listener = TcpListener::bind(addr).await?;
+        let (stream, _) = listener.accept().await?;
+        let (rx, tx) = stream.into_split();
+        (Box::new(rx), Box::new(tx))
+      }
+      Some(("unix", path)) => {
+        let socket = UnixSocket::new_stream()?;
+        socket.bind(path)?;
+        let listener = socket.listen(1)?;
+        let (stream, _) = listener.accept().await?;
+        let (rx, tx) = stream.into_split();
+        (Box::new(rx), Box::new(tx))
+      }
+      #[cfg(any(
+        target_os = "android",
+        target_os = "linux",
+        target_os = "macos"
+      ))]
+      Some(("vsock", addr)) => {
+        let Some((cid, port)) = addr.split_once(':') else {
+          deno_core::anyhow::bail!("invalid vsock addr");
+        };
+        let cid = if cid == "-1" { u32::MAX } else { cid.parse()? };
+        let port = port.parse()?;
+        let addr = VsockAddr::new(cid, port);
+        let listener = VsockListener::bind(addr)?;
+        let (stream, _) = listener.accept().await?;
+        let (rx, tx) = stream.into_split();
+        (Box::new(rx), Box::new(tx))
+      }
+      _ => {
+        deno_core::anyhow::bail!("invalid control sock");
+      }
+    };
+
+    let mut buf = Vec::with_capacity(1024);
+    BufReader::new(rx).read_until(b'\n', &mut buf).await?;
+
+    tokio::spawn(async move {
+      deno_runtime::deno_http::SERVE_NOTIFIER.notified().await;
+
+      #[derive(deno_core::serde::Serialize)]
+      enum Event {
+        Serving,
+      }
+
+      let mut buf = deno_core::serde_json::to_vec(&Event::Serving).unwrap();
+      buf.push(b'\n');
+      let _ = tx.write_all(&buf).await;
+    });
+
+    #[derive(deno_core::serde::Deserialize)]
+    struct Start {
+      cwd: String,
+      args: Vec<String>,
+      env: Vec<(String, String)>,
+    }
+
+    let cmd: Start = deno_core::serde_json::from_slice(&buf)?;
+
+    std::env::set_current_dir(cmd.cwd)?;
+
+    for (k, v) in cmd.env {
+      // SAFETY: We're doing this before any threads are created.
+      unsafe { std::env::set_var(k, v) };
+    }
+
+    let args = [argv0]
+      .into_iter()
+      .chain(cmd.args.into_iter().map(Into::into))
+      .collect();
+
+    Ok(Some((unconfigured, args)))
+  })
+}
+
+async fn auth_tunnel(
+  env_token: Option<String>,
+) -> Result<String, deno_core::anyhow::Error> {
+  let mut args = vec!["deploy".to_string(), "tunnel-login".to_string()];
+
+  if let Some(token) = env_token {
+    args.push("--token".to_string());
+    args.push(token);
+  }
+
+  let mut child = tokio::process::Command::new(env::current_exe()?)
+    .args(args)
+    .spawn()?;
+  let out = child.wait().await?;
+
+  if !out.success() {
+    deno_runtime::exit(1);
+  }
+
+  Ok(tools::deploy::get_token_entry()?.get_password()?)
+}
+
+#[allow(clippy::print_stderr)]
+async fn initialize_tunnel(
+  host: &str,
+  flags: &Flags,
+) -> Result<(), deno_core::anyhow::Error> {
+  let mut factory = CliFactory::from_flags(Arc::new(flags.clone()));
+  let mut cli_options = factory.cli_options()?;
+  let deploy_config = cli_options.start_dir.to_deploy_config()?;
+
+  let env_token = env::var("DENO_DEPLOY_TOKEN").ok();
+  let env_org = env::var("DENO_DEPLOY_ORG").ok();
+  let env_app = env::var("DENO_DEPLOY_APP").ok();
+
+  let token = if env_token.is_some() && env_org.is_some() && env_app.is_some() {
+    env_token.clone().unwrap()
+  } else {
+    auth_tunnel(env_token.clone()).await?
+  };
+
+  let (org, app) = if let (Some(org), Some(app)) = (env_org, env_app) {
+    (org, app)
+  } else {
+    if deploy_config.is_none() {
+      // we regenerate the factory & CliOptions since auth_tunnel updates
+      // the config file with the deploy config, only if it was not set previously.
+      factory = CliFactory::from_flags(Arc::new(flags.clone()));
+      cli_options = factory.cli_options()?;
+    }
+
+    let deploy_config = cli_options
+      .start_dir
+      .to_deploy_config()?
+      .expect("auth to be called");
+
+    (deploy_config.org, deploy_config.app)
+  };
+
+  let Some(addr) = tokio::net::lookup_host(&host).await?.next() else {
+    return Ok(());
+  };
+  let Some((hostname, _)) = host.split_once(':') else {
+    return Ok(());
+  };
+
+  let cert_store_provider = factory.root_cert_store_provider();
+  let root_cert_store = cert_store_provider.get_or_try_init()?.clone();
+
+  let tls_config = deno_runtime::deno_tls::create_client_config(
+    deno_runtime::deno_tls::TlsClientConfigOptions {
+      root_cert_store: Some(root_cert_store),
+      ca_certs: vec![],
+      unsafely_ignore_certificate_errors: None,
+      unsafely_disable_hostname_verification: false,
+      cert_chain_and_key: deno_runtime::deno_tls::TlsKeys::Null,
+      socket_use: deno_runtime::deno_tls::SocketUse::GeneralSsl,
+    },
+  )?;
+
+  let mut metadata = HashMap::new();
+  metadata.insert(
+    "hostname".into(),
+    deno_runtime::deno_os::sys_info::hostname(),
+  );
+  if let Some(entrypoint) = match &flags.subcommand {
+    DenoSubcommand::Run(run_flags) => Some(run_flags.script.to_owned()),
+    DenoSubcommand::Serve(serve_flags) => Some(serve_flags.script.to_owned()),
+    DenoSubcommand::Repl(_) => Some("<repl>".into()),
+    DenoSubcommand::Eval(_) => Some("<eval>".into()),
+    _ => None,
+  } {
+    metadata.insert("entrypoint".into(), entrypoint);
+  }
+
+  let on_event = |event| {
+    use deno_runtime::deno_net::tunnel::Event;
+    match event {
+      Event::Routed(addr) => {
+        let endpoint = if addr.port() == 443 {
+          format!("https://{}", addr.hostname())
+        } else {
+          format!("https://{}:{}", addr.hostname(), addr.port())
+        };
+
+        log::info!(
+          "{}",
+          colors::green(format!("You are connected to {endpoint}"))
+        );
+      }
+      Event::Reconnect(duration, reason) => {
+        let reason = if let Some(reason) = reason {
+          format!(" ({reason})")
+        } else {
+          "".into()
+        };
+        log::info!(
+          "{}",
+          colors::green(format!(
+            "Reconnecting tunnel in {}s...{}",
+            duration.as_secs(),
+            reason
+          ))
+        );
+      }
+      _ => {}
+    }
+  };
+
+  let tunnel = match deno_runtime::deno_net::tunnel::TunnelConnection::connect(
+    addr,
+    hostname.to_owned(),
+    tls_config.clone(),
+    deno_runtime::deno_net::tunnel::Authentication::App {
+      token,
+      org: org.clone(),
+      app: app.clone(),
+    },
+    metadata.clone(),
+    on_event,
+  )
+  .await
+  {
+    Ok(res) => res,
+    Err(deno_runtime::deno_net::tunnel::Error::Unauthorized) => {
+      tools::deploy::get_token_entry()?.delete_credential()?;
+
+      let token = auth_tunnel(env_token).await?;
+      deno_runtime::deno_net::tunnel::TunnelConnection::connect(
+        addr,
+        hostname.to_owned(),
+        tls_config,
+        deno_runtime::deno_net::tunnel::Authentication::App { token, org, app },
+        metadata.clone(),
+        on_event,
+      )
+      .await?
+    }
+    Err(e) => return Err(e.into()),
+  };
+
+  if let Some(metadata) = tunnel.metadata() {
+    for (k, v) in metadata.env {
+      // SAFETY: We're doing this before any threads are created.
+      unsafe {
+        std::env::set_var(k, v);
+      }
+    }
+  }
+
+  deno_runtime::deno_net::tunnel::set_tunnel(tunnel);
+
+  Ok(())
 }

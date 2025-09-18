@@ -1,8 +1,8 @@
 // Copyright 2018-2025 the Deno authors. MIT license.
 
 use test_util as util;
-use util::assert_contains;
 use util::TestContextBuilder;
+use util::assert_contains;
 
 #[test]
 fn init_subcommand_without_dir() {
@@ -199,7 +199,14 @@ async fn init_subcommand_serve() {
     .spawn_with_piped_output();
 
   tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-  let resp = reqwest::get("http://127.0.0.1:9500").await.unwrap();
+  let resp = match reqwest::get("http://127.0.0.1:9500").await {
+    Ok(resp) => resp,
+    Err(_) => {
+      // retry once
+      tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+      reqwest::get("http://127.0.0.1:9500").await.unwrap()
+    }
+  };
 
   let body = resp.text().await.unwrap();
   assert_eq!(body, "Home page");
@@ -216,4 +223,19 @@ async fn init_subcommand_serve() {
   output.assert_exit_code(0);
   assert_contains!(output.stdout(), "4 passed");
   output.skip_output_check();
+}
+
+#[test]
+fn init_npm() {
+  let context = TestContextBuilder::for_npm().use_temp_cwd().build();
+  let cwd = context.temp_dir().path();
+  context
+    .new_command()
+    .args("init --npm @denotest")
+    .with_pty(|mut pty| {
+      pty.expect("Do you want to continue?");
+      pty.write_raw("y\n");
+      pty.expect("Initialized!");
+      assert_eq!(cwd.join("3").read_to_string(), "test");
+    });
 }

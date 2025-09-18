@@ -15,11 +15,13 @@ use std::sync::Arc;
 use anyhow::Context;
 use lsp_types::Uri;
 use pretty_assertions::assert_eq;
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use url::Url;
 
 use crate::assertions::assert_wildcard_match;
+use crate::lsp::SourceFile;
+use crate::lsp::source_file;
 use crate::testdata_path;
 
 /// Characters that are left unencoded in a `Url` path but will be encoded in a
@@ -160,7 +162,7 @@ impl PathRef {
     self.0.to_path_buf()
   }
 
-  pub fn to_string_lossy(&self) -> Cow<str> {
+  pub fn to_string_lossy(&self) -> Cow<'_, str> {
     self.0.to_string_lossy()
   }
 
@@ -591,6 +593,15 @@ impl TempDir {
 
   pub fn write(&self, path: impl AsRef<Path>, text: impl AsRef<[u8]>) {
     self.target_path().join(path).write(text)
+  }
+
+  pub fn source_file(
+    &self,
+    path: impl AsRef<Path>,
+    text: impl AsRef<str>,
+  ) -> SourceFile {
+    let path = self.target_path().join(path);
+    source_file(path, text)
   }
 
   pub fn symlink_dir(

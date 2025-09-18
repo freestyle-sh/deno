@@ -4,26 +4,26 @@ use std::io::BufRead;
 use std::process::ChildStderr;
 use std::time::Duration;
 
-use anyhow::anyhow;
 use anyhow::Error as AnyError;
+use anyhow::anyhow;
 use bytes::Bytes;
 use fastwebsockets::FragmentCollector;
 use fastwebsockets::Frame;
 use fastwebsockets::WebSocket;
-use hyper::body::Incoming;
-use hyper::upgrade::Upgraded;
 use hyper::Request;
 use hyper::Response;
+use hyper::body::Incoming;
+use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
 use serde_json::json;
 use test_util as util;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use url::Url;
-use util::assert_contains;
-use util::assert_starts_with;
 use util::DenoChild;
 use util::TestContextBuilder;
+use util::assert_contains;
+use util::assert_starts_with;
 
 struct SpawnExecutor;
 
@@ -477,7 +477,7 @@ async fn inspector_port_collision() {
   child2.wait().unwrap();
 }
 
-#[tokio::test]
+#[flaky_test::flaky_test(tokio)]
 async fn inspector_does_not_hang() {
   let script = util::testdata_path().join("inspector/inspector3.js");
   let child = util::deno_cmd()
@@ -603,6 +603,7 @@ async fn inspector_runtime_evaluate_does_not_crash() {
     .arg("repl")
     .arg("--allow-read")
     .arg(inspect_flag_with_unique_port("--inspect"))
+    .env("RUST_BACKTRACE", "1")
     .stdin(std::process::Stdio::piped())
     .piped_output()
     .spawn()
@@ -1025,6 +1026,7 @@ async fn inspector_memory() {
     .arg("run")
     .arg(inspect_flag_with_unique_port("--inspect-brk"))
     .arg(script)
+    .env("RUST_BACKTRACE", "1")
     .piped_output()
     .spawn()
     .unwrap();

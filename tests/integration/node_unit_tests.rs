@@ -22,7 +22,6 @@ util::unit_test_factory!(
     _fs_close_test = _fs / _fs_close_test,
     _fs_copy_test = _fs / _fs_copy_test,
     _fs_dir_test = _fs / _fs_dir_test,
-    _fs_dirent_test = _fs / _fs_dirent_test,
     _fs_open_test = _fs / _fs_open_test,
     _fs_read_test = _fs / _fs_read_test,
     _fs_exists_test = _fs / _fs_exists_test,
@@ -69,12 +68,15 @@ util::unit_test_factory!(
     crypto_pbkdf2_test = crypto / crypto_pbkdf2_test,
     crypto_scrypt_test = crypto / crypto_scrypt_test,
     crypto_sign_test = crypto / crypto_sign_test,
+    crypto_timing_safe_equal_test = crypto / crypto_timing_safe_equal_test,
     events_test,
     dgram_test,
     domain_test,
     fs_test,
     fetch_test,
     http_test,
+    https_test,
+    http_no_cert_flag_test,
     http2_test,
     inspector_test,
     _randomBytes_test = internal / _randomBytes_test,
@@ -119,7 +121,7 @@ fn node_unit_test(test: String) {
     .arg("-A");
 
   // Some tests require the root CA cert file to be loaded.
-  if test == "http2_test" || test == "http_test" {
+  if test == "http2_test" || test == "http_test" || test == "https_test" {
     deno = deno.arg("--cert=./tests/testdata/tls/RootCA.pem");
   }
 

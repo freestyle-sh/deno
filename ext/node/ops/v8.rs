@@ -2,11 +2,11 @@
 
 use std::ptr::NonNull;
 
-use deno_core::op2;
-use deno_core::v8;
 use deno_core::FastString;
 use deno_core::GarbageCollected;
 use deno_core::ToJsBuffer;
+use deno_core::op2;
+use deno_core::v8;
 use deno_error::JsErrorBox;
 use v8::ValueDeserializerHelper;
 use v8::ValueSerializerHelper;
@@ -47,8 +47,13 @@ pub struct SerializerDelegate {
   obj: v8::Global<v8::Object>,
 }
 
-impl v8::cppgc::GarbageCollected for Serializer<'_> {
-  fn trace(&self, _visitor: &v8::cppgc::Visitor) {}
+// SAFETY: we're sure this can be GCed
+unsafe impl v8::cppgc::GarbageCollected for Serializer<'_> {
+  fn trace(&self, _visitor: &mut deno_core::v8::cppgc::Visitor) {}
+
+  fn get_name(&self) -> &'static std::ffi::CStr {
+    c"Serializer"
+  }
 }
 
 impl SerializerDelegate {
@@ -71,12 +76,12 @@ impl v8::ValueSerializerImpl for SerializerDelegate {
       .v8_string(scope)
       .unwrap()
       .into();
-    if let Some(v) = obj.get(scope, key) {
-      if let Ok(fun) = v.try_cast::<v8::Function>() {
-        return fun
-          .call(scope, obj.into(), &[shared_array_buffer.into()])
-          .and_then(|ret| ret.uint32_value(scope));
-      }
+    if let Some(v) = obj.get(scope, key)
+      && let Ok(fun) = v.try_cast::<v8::Function>()
+    {
+      return fun
+        .call(scope, obj.into(), &[shared_array_buffer.into()])
+        .and_then(|ret| ret.uint32_value(scope));
     }
     None
   }
@@ -117,11 +122,11 @@ impl v8::ValueSerializerImpl for SerializerDelegate {
       .v8_string(scope)
       .unwrap()
       .into();
-    if let Some(v) = obj.get(scope, key) {
-      if let Ok(v) = v.try_cast::<v8::Function>() {
-        v.call(scope, obj.into(), &[object.into()])?;
-        return Some(true);
-      }
+    if let Some(v) = obj.get(scope, key)
+      && let Ok(v) = v.try_cast::<v8::Function>()
+    {
+      v.call(scope, obj.into(), &[object.into()])?;
+      return Some(true);
     }
 
     None
@@ -225,14 +230,28 @@ pub struct Deserializer<'a> {
   inner: v8::ValueDeserializer<'a>,
 }
 
-impl deno_core::GarbageCollected for Deserializer<'_> {}
+// SAFETY: we're sure this can be GCed
+unsafe impl deno_core::GarbageCollected for Deserializer<'_> {
+  fn trace(&self, _visitor: &mut deno_core::v8::cppgc::Visitor) {}
 
-pub struct DeserializerDelegate {
-  obj: v8::Global<v8::Object>,
+  fn get_name(&self) -> &'static std::ffi::CStr {
+    c"Deserializer"
+  }
 }
 
-impl GarbageCollected for DeserializerDelegate {
-  fn trace(&self, _visitor: &v8::cppgc::Visitor) {}
+pub struct DeserializerDelegate {
+  obj: v8::TracedReference<v8::Object>,
+}
+
+// SAFETY: we're sure this can be GCed
+unsafe impl GarbageCollected for DeserializerDelegate {
+  fn trace(&self, visitor: &mut v8::cppgc::Visitor) {
+    visitor.trace(&self.obj);
+  }
+
+  fn get_name(&self) -> &'static std::ffi::CStr {
+    c"DeserializerDelegate"
+  }
 }
 
 impl v8::ValueDeserializerImpl for DeserializerDelegate {
@@ -241,26 +260,26 @@ impl v8::ValueDeserializerImpl for DeserializerDelegate {
     scope: &mut v8::HandleScope<'s>,
     _value_deserializer: &dyn v8::ValueDeserializerHelper,
   ) -> Option<v8::Local<'s, v8::Object>> {
-    let obj = v8::Local::new(scope, &self.obj);
+    let obj = self.obj.get(scope).unwrap();
     let key = FastString::from_static("_readHostObject")
       .v8_string(scope)
       .unwrap()
       .into();
     let scope = &mut v8::AllowJavascriptExecutionScope::new(scope);
-    if let Some(v) = obj.get(scope, key) {
-      if let Ok(v) = v.try_cast::<v8::Function>() {
-        let result = v.call(scope, obj.into(), &[])?;
-        match result.try_cast() {
-          Ok(res) => return Some(res),
-          Err(_) => {
-            let msg =
-              FastString::from_static("readHostObject must return an object")
-                .v8_string(scope)
-                .unwrap();
-            let error = v8::Exception::type_error(scope, msg);
-            scope.throw_exception(error);
-            return None;
-          }
+    if let Some(v) = obj.get(scope, key)
+      && let Ok(v) = v.try_cast::<v8::Function>()
+    {
+      let result = v.call(scope, obj.into(), &[])?;
+      match result.try_cast() {
+        Ok(res) => return Some(res),
+        Err(_) => {
+          let msg =
+            FastString::from_static("readHostObject must return an object")
+              .v8_string(scope)
+              .unwrap();
+          let error = v8::Exception::type_error(scope, msg);
+          scope.throw_exception(error);
+          return None;
         }
       }
     }
@@ -291,7 +310,7 @@ pub fn op_v8_new_deserializer(
   } else {
     (&[] as &[u8], None::<NonNull<u8>>)
   };
-  let obj = v8::Global::new(scope, obj);
+  let obj = v8::TracedReference::new(scope, obj);
   let inner = v8::ValueDeserializer::new(
     scope,
     Box::new(DeserializerDelegate { obj }),

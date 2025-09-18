@@ -4,12 +4,12 @@ use std::cell::Cell;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use deno_core::error::ResourceError;
-use deno_core::op2;
-use deno_core::v8;
 use deno_core::GarbageCollected;
 use deno_core::OpState;
 use deno_core::ResourceId;
+use deno_core::error::ResourceError;
+use deno_core::op2;
+use deno_core::v8;
 
 pub struct AsyncId(i64);
 
@@ -30,8 +30,7 @@ impl AsyncId {
 }
 
 fn next_async_id(state: &mut OpState) -> i64 {
-  let async_id = state.borrow_mut::<AsyncId>().next();
-  async_id
+  state.borrow_mut::<AsyncId>().next()
 }
 
 #[op2(fast)]
@@ -44,7 +43,14 @@ pub struct AsyncWrap {
   async_id: i64,
 }
 
-impl GarbageCollected for AsyncWrap {}
+// SAFETY: we're sure this can be GCed
+unsafe impl GarbageCollected for AsyncWrap {
+  fn trace(&self, _visitor: &mut deno_core::v8::cppgc::Visitor) {}
+
+  fn get_name(&self) -> &'static std::ffi::CStr {
+    c"AsyncWrap"
+  }
+}
 
 impl AsyncWrap {
   pub(crate) fn create(state: &mut OpState, provider: i32) -> Self {
@@ -85,7 +91,14 @@ pub struct HandleWrap {
   state: Rc<Cell<State>>,
 }
 
-impl GarbageCollected for HandleWrap {}
+// SAFETY: we're sure this can be GCed
+unsafe impl GarbageCollected for HandleWrap {
+  fn trace(&self, _visitor: &mut deno_core::v8::cppgc::Visitor) {}
+
+  fn get_name(&self) -> &'static std::ffi::CStr {
+    c"HandleWrap"
+  }
+}
 
 impl HandleWrap {
   pub(crate) fn create(handle: Option<ResourceId>) -> Self {
@@ -175,12 +188,12 @@ impl HandleWrap {
   //
   // https://github.com/nodejs/node/blob/038d82980ab26cd79abe4409adc2fecad94d7c93/src/handle_wrap.cc#L40-L46
   #[fast]
-  #[rename("r#ref")]
-  fn ref_(&self, state: &mut OpState) {
-    if self.is_alive() {
-      if let Some(handle) = self.handle {
-        state.uv_ref(handle);
-      }
+  #[rename("ref")]
+  fn ref_method(&self, state: &mut OpState) {
+    if self.is_alive()
+      && let Some(handle) = self.handle
+    {
+      state.uv_ref(handle);
     }
   }
 
@@ -189,10 +202,10 @@ impl HandleWrap {
   // https://github.com/nodejs/node/blob/038d82980ab26cd79abe4409adc2fecad94d7c93/src/handle_wrap.cc#L49-L55
   #[fast]
   fn unref(&self, state: &mut OpState) {
-    if self.is_alive() {
-      if let Some(handle) = self.handle {
-        state.uv_unref(handle);
-      }
+    if self.is_alive()
+      && let Some(handle) = self.handle
+    {
+      state.uv_unref(handle);
     }
   }
 }
@@ -239,7 +252,7 @@ mod tests {
     );
 
     let mut runtime = JsRuntime::new(RuntimeOptions {
-      extensions: vec![test_ext::init_ops()],
+      extensions: vec![test_ext::init()],
       ..Default::default()
     });
 
