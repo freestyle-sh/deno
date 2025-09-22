@@ -5,6 +5,7 @@ export {
   Blob,
   btoa,
   Buffer,
+  File,
   constants,
   default,
   INSPECT_MAX_BYTES,
