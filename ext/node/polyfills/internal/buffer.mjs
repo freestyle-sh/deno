@@ -2996,6 +2996,7 @@ const mod = {
   Buffer,
   constants,
   isAscii,
+  File,
   isUtf8,
   get INSPECT_MAX_BYTES() {
     return INSPECT_MAX_BYTES_;
