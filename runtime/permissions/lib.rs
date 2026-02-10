@@ -67,6 +67,15 @@ pub struct PermissionDeniedError {
   pub state: PermissionState,
 }
 
+/// Hook for custom dynamic network permission checking.
+/// When set on PermissionsContainer, these methods are called instead of
+/// the standard static allow/deny list checks.
+pub trait NetPermissionHook: Send + Sync {
+  fn check_net_url(&self, url: &Url, api_name: &str) -> Result<(), PermissionCheckError>;
+  fn check_net(&self, host: &str, port: Option<u16>, api_name: &str) -> Result<(), PermissionCheckError>;
+  fn check_net_vsock(&self, cid: u32, port: u32, api_name: &str) -> Result<(), PermissionCheckError>;
+}
+
 fn format_permission_error(name: &'static str) -> String {
   if is_standalone() {
     format!(
@@ -3767,10 +3776,30 @@ impl PermissionCheckError {
 /// passed to a future that will prompt the user for permission (and in such
 /// case might need to be mutated). Also for the Web Worker API we need a way
 /// to send permissions to a new thread.
-#[derive(Clone, Debug)]
 pub struct PermissionsContainer {
   descriptor_parser: Arc<dyn PermissionDescriptorParser>,
   inner: Arc<Mutex<Permissions>>,
+  net_hook: Option<Arc<dyn NetPermissionHook>>,
+}
+
+impl Clone for PermissionsContainer {
+  fn clone(&self) -> Self {
+    Self {
+      descriptor_parser: self.descriptor_parser.clone(),
+      inner: self.inner.clone(),
+      net_hook: self.net_hook.clone(),
+    }
+  }
+}
+
+impl fmt::Debug for PermissionsContainer {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("PermissionsContainer")
+      .field("descriptor_parser", &self.descriptor_parser)
+      .field("inner", &self.inner)
+      .field("net_hook", &self.net_hook.as_ref().map(|_| "..."))
+      .finish()
+  }
 }
 
 impl PermissionsContainer {
@@ -3781,6 +3810,7 @@ impl PermissionsContainer {
     Self {
       descriptor_parser,
       inner: Arc::new(Mutex::new(perms)),
+      net_hook: None,
     }
   }
 
@@ -3788,6 +3818,7 @@ impl PermissionsContainer {
     Self {
       descriptor_parser: self.descriptor_parser.clone(),
       inner: Arc::new(Mutex::new(self.inner.lock().clone())),
+      net_hook: self.net_hook.clone(),
     }
   }
 
@@ -3795,6 +3826,10 @@ impl PermissionsContainer {
     descriptor_parser: Arc<dyn PermissionDescriptorParser>,
   ) -> Self {
     Self::new(descriptor_parser, Permissions::allow_all())
+  }
+
+  pub fn set_net_hook(&mut self, hook: Arc<dyn NetPermissionHook>) {
+    self.net_hook = Some(hook);
   }
 
   pub fn create_child_permissions(
@@ -4327,6 +4362,9 @@ impl PermissionsContainer {
     url: &Url,
     api_name: &str,
   ) -> Result<(), PermissionCheckError> {
+    if let Some(hook) = &self.net_hook {
+      return hook.check_net_url(url, api_name);
+    }
     let mut inner = self.inner.lock();
     audit_and_skip_check_if_is_permission_fully_granted!(
       inner.net,
@@ -4344,6 +4382,9 @@ impl PermissionsContainer {
     host: &(T, Option<u16>),
     api_name: &str,
   ) -> Result<(), PermissionCheckError> {
+    if let Some(hook) = &self.net_hook {
+      return hook.check_net(host.0.as_ref(), host.1, api_name);
+    }
     let mut inner = self.inner.lock();
     let inner = &mut inner.net;
     audit_and_skip_check_if_is_permission_fully_granted!(
@@ -4368,6 +4409,9 @@ impl PermissionsContainer {
     port: u32,
     api_name: &str,
   ) -> Result<(), PermissionCheckError> {
+    if let Some(hook) = &self.net_hook {
+      return hook.check_net_vsock(cid, port, api_name);
+    }
     let mut inner = self.inner.lock();
     audit_and_skip_check_if_is_permission_fully_granted!(
       inner.net,
