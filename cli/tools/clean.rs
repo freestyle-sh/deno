@@ -1,4 +1,4 @@
-// Copyright 2018-2025 the Deno authors. MIT license.
+// Copyright 2018-2026 the Deno authors. MIT license.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -28,7 +28,6 @@ use crate::factory::CliFactory;
 use crate::graph_container::CollectSpecifiersOptions;
 use crate::graph_container::ModuleGraphContainer;
 use crate::graph_container::ModuleGraphUpdatePermit;
-use crate::graph_util::BuildGraphRequest;
 use crate::graph_util::BuildGraphWithNpmOptions;
 use crate::sys::CliSys;
 use crate::util::fs::FsCleaner;
@@ -205,10 +204,10 @@ async fn clean_except(
   graph.packages = PackageSpecifiers::default();
   let graph_builder = factory.module_graph_builder().await?;
   graph_builder
-    .build_graph_with_npm_resolution(
+    .build_graph_roots_with_npm_resolution(
       graph,
+      roots.clone(),
       BuildGraphWithNpmOptions {
-        request: BuildGraphRequest::Roots(roots.clone()),
         loader: None,
         is_dynamic: false,
         npm_caching: NpmCachingStrategy::Manual,
@@ -250,7 +249,7 @@ async fn clean_except(
           if let Some(managed) = npm_resolver.as_managed() {
             let id = managed
               .resolution()
-              .resolve_pkg_id_from_deno_module(npm_module.nv_reference.nv())
+              .resolve_pkg_id_from_pkg_req(npm_module.pkg_req_ref.req())
               .unwrap();
             npm_reqs
               .extend(managed.resolution().resolve_pkg_reqs_from_pkg_id(&id));
@@ -313,7 +312,10 @@ async fn clean_except(
 
   let jsr_url = crate::args::jsr_url();
   add_jsr_meta_paths(graph, &mut keep_paths_trie, jsr_url, &|url| {
-    http_cache.local_path_for_url(url).map_err(Into::into)
+    http_cache
+      .local_path_for_url(url)
+      .map_err(Into::into)
+      .map(Some)
   })?;
   walk_removing(
     &mut state,
@@ -327,9 +329,6 @@ async fn clean_except(
   let mut node_modules_cleaned = FsCleaner::default();
 
   if let Some(dir) = node_modules_path {
-    // let npm_installer = factory.npm_installer_if_managed().await?.unwrap();
-    // npm_installer.
-    // let npm_installer = npm_installer.as_local().unwrap();
     clean_node_modules(
       &mut node_modules_cleaned,
       &node_modules_keep,
@@ -347,19 +346,29 @@ async fn clean_except(
       trie.add_rewrite(deno_dir.root.clone(), deno_dir_root_canonical);
     }
     let cache = cache.clone();
-    add_jsr_meta_paths(graph, &mut trie, jsr_url, &|_url| {
-      if let Ok(Some(path)) = cache.local_path_for_url(_url) {
-        Ok(path)
-      } else {
-        panic!("should not happen")
+    add_jsr_meta_paths(graph, &mut trie, jsr_url, &|url| match cache
+      .local_path_for_url(url)
+    {
+      Ok(path) => Ok(path),
+      Err(err) => {
+        log::warn!(
+          "failed to get local path for jsr meta url {}: {}",
+          url,
+          err
+        );
+        Ok(None)
       }
     })?;
     for url in keep {
       if url.scheme() == "http" || url.scheme() == "https" {
-        if let Ok(Some(path)) = cache.local_path_for_url(url) {
-          trie.insert(path);
-        } else {
-          panic!("should not happen")
+        match cache.local_path_for_url(url) {
+          Ok(Some(path)) => {
+            trie.insert(path);
+          }
+          Ok(None) => {}
+          Err(err) => {
+            log::warn!("failed to get local path for url {}: {}", url, err);
+          }
         }
       }
     }
@@ -410,20 +419,24 @@ fn add_jsr_meta_paths(
   graph: &ModuleGraph,
   path_trie: &mut PathTrie,
   jsr_url: &Url,
-  url_to_path: &dyn Fn(&Url) -> Result<PathBuf, AnyError>,
+  url_to_path: &dyn Fn(&Url) -> Result<Option<PathBuf>, AnyError>,
 ) -> Result<(), AnyError> {
   for package in graph.packages.mappings().values() {
     let Ok(base_url) = jsr_url.join(&format!("{}/", &package.name)) else {
       continue;
     };
     let keep = url_to_path(&base_url.join("meta.json").unwrap())?;
-    path_trie.insert(keep);
+    if let Some(keep) = keep {
+      path_trie.insert(keep);
+    }
     let keep = url_to_path(
       &base_url
         .join(&format!("{}_meta.json", package.version))
         .unwrap(),
     )?;
-    path_trie.insert(keep);
+    if let Some(keep) = keep {
+      path_trie.insert(keep);
+    }
   }
   Ok(())
 }

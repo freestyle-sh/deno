@@ -1,18 +1,20 @@
-#!/usr/bin/env -S deno run --allow-write=. --lock=./tools/deno.lock.json
-// Copyright 2018-2025 the Deno authors. MIT license.
+#!/usr/bin/env -S deno run --allow-write=. --allow-read=. --lock=./tools/deno.lock.json
+// Copyright 2018-2026 the Deno authors. MIT license.
 import { stringify } from "jsr:@std/yaml@^0.221/stringify";
+import { parse as parseToml } from "jsr:@std/toml";
 
 // Bump this number when you want to purge the cache.
 // Note: the tools/release/01_bump_crate_versions.ts script will update this version
 // automatically via regex, so ensure that this line maintains this format.
-const cacheVersion = 73;
+const cacheVersion = 94;
 
 const ubuntuX86Runner = "ubuntu-24.04";
 const ubuntuX86XlRunner = "ghcr.io/cirruslabs/ubuntu-runner-amd64:24.04";
-const ubuntuARMRunner = "ubicloud-standard-16-arm";
+const ubuntuARMRunner = "ghcr.io/cirruslabs/ubuntu-runner-arm64:24.04-plus";
 const windowsX86Runner = "windows-2022";
 const windowsX86XlRunner = "windows-2022-xl";
-const macosX86Runner = "macos-13";
+const windowsArmRunner = "windows-11-arm";
+const macosX86Runner = "macos-15-intel";
 const macosArmRunner = "macos-14";
 const selfHostedMacosArmRunner = "ghcr.io/cirruslabs/macos-runner:sonoma";
 
@@ -61,7 +63,37 @@ const Runners = {
     runner:
       `\${{ github.repository == 'denoland/deno' && '${windowsX86XlRunner}' || '${windowsX86Runner}' }}`,
   },
+  windowsArm: {
+    os: "windows",
+    arch: "aarch64",
+    runner: windowsArmRunner,
+  },
 } as const;
+
+// discover all non-binary, non-test workspace members for the libs test job
+const rootCargoToml = parseToml(
+  Deno.readTextFileSync(new URL("../../Cargo.toml", import.meta.url)),
+) as { workspace: { members: string[] } };
+
+const libPackages: string[] = [];
+for (const member of rootCargoToml.workspace.members) {
+  // test crates depend on the deno binary at runtime
+  if (member.startsWith("tests")) continue;
+
+  const cargoToml = parseToml(
+    Deno.readTextFileSync(
+      new URL(`../../${member}/Cargo.toml`, import.meta.url),
+    ),
+  ) as { package: { name: string }; bin?: unknown[] };
+
+  // skip binary crates (they need their own build step)
+  if (cargoToml.bin) continue;
+
+  libPackages.push(cargoToml.package.name);
+}
+
+const libTestPackageArgs = libPackages.map((p) => `-p ${p}`).join(" ");
+const libExcludeArgs = libPackages.map((p) => `--exclude ${p}`).join(" ");
 
 const prCacheKeyPrefix =
   `${cacheVersion}-cargo-target-\${{ matrix.os }}-\${{ matrix.arch }}-\${{ matrix.profile }}-\${{ matrix.job }}-`;
@@ -76,7 +108,7 @@ const prCachePath = [
 ].join("\n");
 
 // Note that you may need to add more version to the `apt-get remove` line below if you change this
-const llvmVersion = 20;
+const llvmVersion = 21;
 const installPkgsCommand =
   `sudo apt-get install -y --no-install-recommends clang-${llvmVersion} lld-${llvmVersion} clang-tools-${llvmVersion} clang-format-${llvmVersion} clang-tidy-${llvmVersion}`;
 const sysRootStep = {
@@ -164,7 +196,7 @@ CFLAGS=$CFLAGS
 
 const installBenchTools = "./tools/install_prebuilt.js wrk hyperfine";
 
-const cloneRepoStep = [{
+const cloneRepoSteps = [{
   name: "Configure git",
   run: [
     "git config --global core.symlinks true",
@@ -172,7 +204,7 @@ const cloneRepoStep = [{
   ].join("\n"),
 }, {
   name: "Clone repository",
-  uses: "actions/checkout@v4",
+  uses: "actions/checkout@v6",
   with: {
     // Use depth > 1, because sometimes we need to rebuild main and if
     // other commits have landed it will become impossible to rebuild if
@@ -190,9 +222,28 @@ const submoduleStep = (submodule: string) => ({
 const installRustStep = {
   uses: "dsherret/rust-toolchain-file@v1",
 };
+const installLldStep = {
+  name: "Install macOS aarch64 lld",
+  if: `matrix.os == 'macos' && matrix.arch == 'aarch64'`,
+  env: {
+    GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}",
+  },
+  run: [
+    "./tools/install_prebuilt.js ld64.lld",
+  ].join("\n"),
+};
+const updatePrebuiltGithubPath = {
+  if: `matrix.os == 'macos'`,
+  env: {
+    GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}",
+  },
+  run: [
+    "echo $GITHUB_WORKSPACE/third_party/prebuilt/mac >> $GITHUB_PATH",
+  ].join("\n"),
+};
 const installPythonSteps = [{
   name: "Install Python",
-  uses: "actions/setup-python@v5",
+  uses: "actions/setup-python@v6",
   with: { "python-version": 3.11 },
 }, {
   name: "Remove unused versions of Python",
@@ -207,18 +258,61 @@ const installPythonSteps = [{
 }];
 const installNodeStep = {
   name: "Install Node",
-  uses: "actions/setup-node@v4",
-  with: { "node-version": 18 },
+  uses: "actions/setup-node@v6",
+  with: { "node-version": 22 },
 };
 const installDenoStep = {
   name: "Install Deno",
   uses: "denoland/setup-deno@v2",
   with: { "deno-version": "v2.x" },
 };
+const cacheCargoHomeStep = {
+  name: "Cache Cargo home",
+  uses: "cirruslabs/cache@v4",
+  with: {
+    // See https://doc.rust-lang.org/cargo/guide/cargo-home.html#caching-the-cargo-home-in-ci
+    // Note that with the new sparse registry format, we no longer have to cache a `.git` dir
+    path: [
+      "~/.cargo/.crates.toml",
+      "~/.cargo/.crates2.json",
+      "~/.cargo/bin",
+      "~/.cargo/registry/index",
+      "~/.cargo/registry/cache",
+      "~/.cargo/git/db",
+    ].join("\n"),
+    key:
+      `${cacheVersion}-cargo-home-\${{ matrix.os }}-\${{ matrix.arch }}-\${{ hashFiles('Cargo.lock') }}`,
+    // We will try to restore from the closest cargo-home we can find
+    "restore-keys":
+      `${cacheVersion}-cargo-home-\${{ matrix.os }}-\${{ matrix.arch }}-`,
+  },
+};
+const restoreCachePrStep = {
+  // Restore cache from the latest 'main' branch build.
+  name: "Restore cache build output (PR)",
+  uses: "actions/cache/restore@v4",
+  if:
+    "github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/')",
+  with: {
+    path: prCachePath,
+    key: "never_saved",
+    "restore-keys": prCacheKeyPrefix,
+  },
+};
+const saveCacheMainStep = {
+  // In main branch, always create a fresh cache
+  name: "Save cache build output (main)",
+  uses: "actions/cache/save@v4",
+  if: "matrix.job == 'test' && github.ref == 'refs/heads/main'",
+  with: {
+    path: prCachePath,
+    key: prCacheKey,
+  },
+};
 
 const authenticateWithGoogleCloud = {
   name: "Authenticate with Google Cloud",
-  uses: "google-github-actions/auth@v2",
+  uses: "google-github-actions/auth@v3",
   with: {
     "project_id": "denoland",
     "credentials_json": "${{ secrets.GCP_SA_KEY }}",
@@ -256,9 +350,16 @@ function withCondition(
   step: Record<string, unknown>,
   condition: string,
 ): Record<string, unknown> {
+  function maybeParens(condition: string) {
+    if (condition.includes("&&") || condition.includes("||")) {
+      return `(${condition})`;
+    } else {
+      return condition;
+    }
+  }
   return {
     ...step,
-    if: "if" in step ? `${condition} && (${step.if})` : condition,
+    if: "if" in step ? `${maybeParens(condition)} && (${step.if})` : condition,
   };
 }
 
@@ -351,7 +452,7 @@ const ci = {
         skip_build: "${{ steps.check.outputs.skip_build }}",
       },
       steps: onlyIfDraftPr([
-        ...cloneRepoStep,
+        ...cloneRepoSteps,
         {
           id: "check",
           if: "!contains(github.event.pull_request.labels.*.name, 'ci-draft')",
@@ -413,6 +514,15 @@ const ci = {
             profile: "release",
             skip_pr: true,
           }, {
+            ...Runners.windowsArm,
+            job: "test",
+            profile: "debug",
+          }, {
+            ...Runners.windowsArm,
+            job: "test",
+            profile: "release",
+            skip_pr: true,
+          }, {
             ...Runners.linuxX86Xl,
             job: "test",
             profile: "release",
@@ -433,10 +543,6 @@ const ci = {
             profile: "debug",
             use_sysroot: true,
           }, {
-            ...Runners.linuxX86,
-            job: "lint",
-            profile: "debug",
-          }, {
             ...Runners.linuxArm,
             job: "test",
             profile: "debug",
@@ -446,14 +552,6 @@ const ci = {
             profile: "release",
             use_sysroot: true,
             skip_pr: true,
-          }, {
-            ...Runners.macosX86,
-            job: "lint",
-            profile: "debug",
-          }, {
-            ...Runners.windowsX86,
-            job: "lint",
-            profile: "debug",
           }]),
         },
         // Always run main branch builds to completion. This allows the cache to
@@ -471,7 +569,7 @@ const ci = {
         RUST_LIB_BACKTRACE: 0,
       },
       steps: skipJobsIfPrAndMarkedSkip([
-        ...cloneRepoStep,
+        ...cloneRepoSteps,
         submoduleStep("./tests/util/std"),
         {
           ...submoduleStep("./tests/wpt/suite"),
@@ -500,53 +598,37 @@ const ci = {
             "    -czvf target/release/deno_src.tar.gz -C .. deno",
           ].join("\n"),
         },
-        {
-          name: "Cache Cargo home",
-          uses: "cirruslabs/cache@v4",
-          with: {
-            // See https://doc.rust-lang.org/cargo/guide/cargo-home.html#caching-the-cargo-home-in-ci
-            // Note that with the new sparse registry format, we no longer have to cache a `.git` dir
-            path: [
-              "~/.cargo/.crates.toml",
-              "~/.cargo/.crates2.json",
-              "~/.cargo/bin",
-              "~/.cargo/registry/index",
-              "~/.cargo/registry/cache",
-              "~/.cargo/git/db",
-            ].join("\n"),
-            key:
-              `${cacheVersion}-cargo-home-\${{ matrix.os }}-\${{ matrix.arch }}-\${{ hashFiles('Cargo.lock') }}`,
-            // We will try to restore from the closest cargo-home we can find
-            "restore-keys":
-              `${cacheVersion}-cargo-home-\${{ matrix.os }}-\${{ matrix.arch }}-`,
-          },
-        },
+        cacheCargoHomeStep,
         installRustStep,
         {
-          if:
-            "matrix.job == 'lint' || matrix.job == 'test' || matrix.job == 'bench'",
-          ...installDenoStep,
+          if: "matrix.os == 'linux' && matrix.arch == 'aarch64'",
+          name: "Load 'vsock_loopback; kernel module",
+          run: "sudo modprobe vsock_loopback",
         },
+        withCondition(
+          installDenoStep,
+          "(matrix.job == 'test' || matrix.job == 'bench') && !(matrix.os == 'windows' && matrix.arch == 'aarch64')",
+        ),
         ...installPythonSteps.map((s) =>
           withCondition(
             s,
-            "matrix.job != 'lint' && (matrix.os != 'linux' || matrix.arch != 'aarch64')",
+            "matrix.os != 'linux' || matrix.arch != 'aarch64'",
           )
         ),
-        {
-          if: "matrix.job == 'bench' || matrix.job == 'test'",
-          ...installNodeStep,
-        },
-        {
-          if: [
+        withCondition(
+          installNodeStep,
+          "matrix.job == 'bench' || matrix.job == 'test'",
+        ),
+        withCondition(
+          authenticateWithGoogleCloud,
+          [
             "matrix.profile == 'release' &&",
             "matrix.job == 'test' &&",
             "github.repository == 'denoland/deno' &&",
             "(github.ref == 'refs/heads/main' ||",
             "startsWith(github.ref, 'refs/tags/'))",
           ].join("\n"),
-          ...authenticateWithGoogleCloud,
-        },
+        ),
         {
           name: "Setup gcloud (unix)",
           if: [
@@ -557,7 +639,7 @@ const ci = {
             "(github.ref == 'refs/heads/main' ||",
             "startsWith(github.ref, 'refs/tags/'))",
           ].join("\n"),
-          uses: "google-github-actions/setup-gcloud@v2",
+          uses: "google-github-actions/setup-gcloud@v3",
           with: {
             project_id: "denoland",
           },
@@ -605,27 +687,16 @@ const ci = {
           ].join("\n"),
           if: `matrix.os == 'macos'`,
         },
-        {
-          name: "Install macOS aarch64 lld",
-          env: {
-            GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}",
-          },
-          run: [
-            "./tools/install_prebuilt.js ld64.lld",
-          ].join("\n"),
-          if: `matrix.os == 'macos' && matrix.arch == 'aarch64'`,
-        },
+        installLldStep,
         {
           name: "Install rust-codesign",
           env: {
             GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}",
           },
-          run: [
-            "./tools/install_prebuilt.js rcodesign",
-            "echo $GITHUB_WORKSPACE/third_party/prebuilt/mac >> $GITHUB_PATH",
-          ].join("\n"),
+          run: "./tools/install_prebuilt.js rcodesign",
           if: `matrix.os == 'macos'`,
         },
+        updatePrebuiltGithubPath,
         {
           name: "Log versions",
           run: [
@@ -653,18 +724,7 @@ const ci = {
             installBenchTools,
           ].join("\n"),
         },
-        {
-          // Restore cache from the latest 'main' branch build.
-          name: "Restore cache build output (PR)",
-          uses: "actions/cache/restore@v4",
-          if:
-            "github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/')",
-          with: {
-            path: prCachePath,
-            key: "never_saved",
-            "restore-keys": prCacheKeyPrefix,
-          },
-        },
+        restoreCachePrStep,
         {
           name: "Apply and update mtime cache",
           if: "!startsWith(github.ref, 'refs/tags/')",
@@ -675,39 +735,11 @@ const ci = {
         },
         {
           name: "Set up playwright cache",
-          uses: "actions/cache@v4",
+          uses: "actions/cache@v5",
           with: {
             path: "./.ms-playwright",
             key: "playwright-${{ runner.os }}-${{ runner.arch }}",
           },
-        },
-        {
-          name: "test_format.js",
-          if: "matrix.job == 'lint' && matrix.os == 'linux'",
-          run:
-            "deno run --allow-write --allow-read --allow-run --allow-net ./tools/format.js --check",
-        },
-        {
-          name: "lint.js",
-          if: "matrix.job == 'lint'",
-          env: {
-            GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}",
-          },
-          run:
-            "deno run --allow-write --allow-read --allow-run --allow-net --allow-env ./tools/lint.js",
-        },
-        {
-          name: "jsdoc_checker.js",
-          if: "matrix.job == 'lint'",
-          run:
-            "deno run --allow-read --allow-env --allow-sys ./tools/jsdoc_checker.js",
-        },
-        {
-          name: "Check tracing build",
-          if:
-            "matrix.job == 'test' && matrix.profile == 'debug' && matrix.os == 'linux' && matrix.arch == 'x86_64'",
-          run: "cargo check -p deno --features=lsp-tracing",
-          env: { CARGO_PROFILE_DEV_DEBUG: 0 },
         },
         {
           name: "Build debug",
@@ -782,7 +814,7 @@ const ci = {
             "(github.ref == 'refs/heads/main' ||",
             "startsWith(github.ref, 'refs/tags/'))))",
           ].join("\n"),
-          uses: "actions/upload-artifact@v4",
+          uses: "actions/upload-artifact@v6",
           with: {
             name:
               "deno-${{ matrix.os }}-${{ matrix.arch }}-${{ github.event.number }}",
@@ -867,7 +899,7 @@ const ci = {
             "github.repository == 'denoland/deno' &&",
             "(github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))",
           ].join("\n"),
-          uses: "azure/trusted-signing-action@v0",
+          uses: "Azure/artifact-signing-action@v0",
           with: {
             "endpoint": "https://eus.codesigning.azure.net/",
             "trusted-signing-account-name": "deno-cli-code-signing",
@@ -956,7 +988,8 @@ const ci = {
             // Run full tests only on Linux.
             "matrix.os == 'linux'",
           ].join("\n"),
-          run: "cargo test --locked --features=panic-trace",
+          run:
+            `cargo test --workspace --locked ${libExcludeArgs} --features=panic-trace`,
           env: { CARGO_PROFILE_DEV_DEBUG: 0 },
         },
         {
@@ -969,8 +1002,8 @@ const ci = {
           run: [
             // Run unit then integration tests. Skip doc tests here
             // since they are sometimes very slow on Mac.
-            "cargo test --locked --lib --features=panic-trace",
-            "cargo test --locked --tests --features=panic-trace",
+            `cargo test --workspace --locked ${libExcludeArgs} --lib --features=panic-trace`,
+            `cargo test --workspace --locked ${libExcludeArgs} --tests --features=panic-trace`,
           ].join("\n"),
           env: { CARGO_PROFILE_DEV_DEBUG: 0 },
         },
@@ -983,7 +1016,8 @@ const ci = {
             "github.repository == 'denoland/deno' &&",
             "!startsWith(github.ref, 'refs/tags/')))",
           ].join("\n"),
-          run: "cargo test --release --locked --features=panic-trace",
+          run:
+            `cargo test --workspace --release --locked ${libExcludeArgs} --features=panic-trace`,
         },
         {
           name: "Ensure no git changes",
@@ -998,6 +1032,31 @@ const ci = {
             "exit 1",
             "fi",
           ].join("\n"),
+        },
+        {
+          name: "Combine test results",
+          if: [
+            "always() &&",
+            "matrix.job == 'test' &&",
+            "!startsWith(github.ref, 'refs/tags/') &&",
+            "!(matrix.os == 'windows' && matrix.arch == 'aarch64')",
+          ].join("\n"),
+          run: "deno run -RWN ./tools/combine_test_results.js",
+        },
+        {
+          name: "Upload test results",
+          uses: "actions/upload-artifact@v4",
+          if: [
+            "always() &&",
+            "matrix.job == 'test' &&",
+            "!startsWith(github.ref, 'refs/tags/') &&",
+            "!(matrix.os == 'windows' && matrix.arch == 'aarch64')",
+          ].join("\n"),
+          with: {
+            name:
+              "test-results-${{ matrix.os }}-${{ matrix.arch }}-${{ matrix.profile }}.json",
+            path: "target/test_results.json",
+          },
         },
         {
           name: "Configure hosts file for WPT",
@@ -1075,7 +1134,7 @@ const ci = {
           run: "cargo bench --locked",
         },
         {
-          name: "Post Benchmarks",
+          name: "Post benchmarks",
           if: [
             "matrix.job == 'bench' &&",
             "github.repository == 'denoland/deno' &&",
@@ -1100,7 +1159,7 @@ const ci = {
         {
           name: "Build product size info",
           if:
-            "matrix.job != 'lint' && matrix.profile != 'debug' && github.repository == 'denoland/deno' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))",
+            "matrix.profile != 'debug' && github.repository == 'denoland/deno' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))",
           run: [
             'du -hd1 "./target/${{ matrix.profile }}"',
             'du -ha  "./target/${{ matrix.profile }}/deno"',
@@ -1163,7 +1222,7 @@ const ci = {
         },
         {
           name: "Upload release to GitHub",
-          uses: "softprops/action-gh-release@v0.1.15",
+          uses: "softprops/action-gh-release@v2",
           if: [
             "matrix.job == 'test' &&",
             "matrix.profile == 'release' &&",
@@ -1179,6 +1238,10 @@ const ci = {
               "target/release/deno-x86_64-pc-windows-msvc.zip.sha256sum",
               "target/release/denort-x86_64-pc-windows-msvc.zip",
               "target/release/denort-x86_64-pc-windows-msvc.zip.sha256sum",
+              "target/release/deno-aarch64-pc-windows-msvc.zip",
+              "target/release/deno-aarch64-pc-windows-msvc.zip.sha256sum",
+              "target/release/denort-aarch64-pc-windows-msvc.zip",
+              "target/release/denort-aarch64-pc-windows-msvc.zip.sha256sum",
               "target/release/deno-x86_64-unknown-linux-gnu.zip",
               "target/release/deno-x86_64-unknown-linux-gnu.zip.sha256sum",
               "target/release/denort-x86_64-unknown-linux-gnu.zip",
@@ -1202,52 +1265,134 @@ const ci = {
             draft: true,
           },
         },
-        {
-          // In main branch, always create a fresh cache
-          name: "Save cache build output (main)",
-          uses: "actions/cache/save@v4",
-          if:
-            "(matrix.job == 'test' || matrix.job == 'lint') && github.ref == 'refs/heads/main'",
-          with: {
-            path: prCachePath,
-            key: prCacheKey,
-          },
-        },
+        saveCacheMainStep,
       ]),
     },
-    libs: {
-      name: "build libs",
+    lint: {
+      name: "lint ${{ matrix.profile }} ${{ matrix.os }}-${{ matrix.arch }}",
       needs: ["pre_build"],
       if: "${{ needs.pre_build.outputs.skip_build != 'true' }}",
-      "runs-on": ubuntuX86Runner,
+      "runs-on": "${{ matrix.runner }}",
       "timeout-minutes": 30,
+      defaults: {
+        run: {
+          shell: "bash",
+        },
+      },
+      strategy: {
+        matrix: {
+          include: [{
+            ...Runners.linuxX86,
+            profile: "debug",
+            job: "lint",
+          }, {
+            ...Runners.macosX86,
+            profile: "debug",
+            job: "lint",
+          }, {
+            ...Runners.windowsX86,
+            profile: "debug",
+            job: "lint",
+          }],
+        },
+      },
+      steps: [
+        ...cloneRepoSteps,
+        submoduleStep("./tests/util/std"),
+        cacheCargoHomeStep,
+        installRustStep,
+        installDenoStep,
+        restoreCachePrStep,
+        {
+          name: "test_format.js",
+          if: "matrix.os == 'linux'",
+          run:
+            "deno run --allow-write --allow-read --allow-run --allow-net ./tools/format.js --check",
+        },
+        {
+          name: "lint.js",
+          env: {
+            GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}",
+          },
+          run:
+            "deno run --allow-write --allow-read --allow-run --allow-net --allow-env ./tools/lint.js",
+        },
+        {
+          name: "jsdoc_checker.js",
+          run:
+            "deno run --allow-read --allow-env --allow-sys ./tools/jsdoc_checker.js",
+        },
+        saveCacheMainStep,
+      ],
+    },
+    libs: {
+      name: "libs ${{ matrix.profile }} ${{ matrix.os }}-${{ matrix.arch }}",
+      needs: ["pre_build"],
+      if: "${{ needs.pre_build.outputs.skip_build != 'true' }}",
+      "runs-on": "${{ matrix.runner }}",
+      "timeout-minutes": 30,
+      strategy: {
+        matrix: {
+          include: [{
+            ...Runners.linuxX86,
+            profile: "debug",
+            job: "libs",
+          }, {
+            ...Runners.macosArm,
+            profile: "debug",
+            job: "libs",
+          }, {
+            ...Runners.windowsX86,
+            profile: "debug",
+            job: "libs",
+          }],
+        },
+      },
       steps: skipJobsIfPrAndMarkedSkip([
-        ...cloneRepoStep,
+        ...cloneRepoSteps,
+        submoduleStep("./tests/util/std"),
+        cacheCargoHomeStep,
         installRustStep,
         {
+          if: "matrix.os == 'macos'",
+          ...installDenoStep,
+        },
+        installLldStep,
+        updatePrebuiltGithubPath,
+        {
           name: "Install wasm target",
+          if: "matrix.os == 'linux'",
           run: "rustup target add wasm32-unknown-unknown",
         },
         // we want these crates to be Wasm compatible
         {
           name: "Cargo check (deno_resolver)",
+          if: "matrix.os == 'linux'",
           run:
             "cargo check --target wasm32-unknown-unknown -p deno_resolver && cargo check --target wasm32-unknown-unknown -p deno_resolver --features graph && cargo check --target wasm32-unknown-unknown -p deno_resolver --features graph --features deno_ast",
         },
         {
           name: "Cargo check (deno_npm_installer)",
+          if: "matrix.os == 'linux'",
           run:
             "cargo check --target wasm32-unknown-unknown -p deno_npm_installer",
         },
         {
           name: "Cargo check (deno_config)",
+          if: "matrix.os == 'linux'",
           run: [
             "cargo check --no-default-features -p deno_config",
             "cargo check --no-default-features --features workspace -p deno_config",
             "cargo check --no-default-features --features package_json -p deno_config",
             "cargo check --no-default-features --features workspace --features sync -p deno_config",
             "cargo check --target wasm32-unknown-unknown --all-features -p deno_config",
+            "cargo check -p deno --features=lsp-tracing",
           ].join("\n"),
+        },
+        {
+          name: "Test libs",
+          run: `cargo test --locked ${libTestPackageArgs}`,
+          env: { CARGO_PROFILE_DEV_DEBUG: 0 },
         },
       ]),
     },
